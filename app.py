@@ -7,22 +7,19 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- 1. THE MODEL HIERARCHY ---
-# We list models from BEST to WORST.
-# The system will try the top one; if it fails, it drops down.
+# --- 1. THE MODEL HIERARCHY (Updated) ---
+# The system tries these in order. 
+# If one fails (error 429/500), it automatically switches to the next.
 MODEL_ROSTER = [
-    "gemini-2.5-flash",       # The Genius
-    "gemini-2.5-flash-lite",  # The Fast Worker
-    "gemini-1.5-flash"        # The Old Reliable (Backup)
+    "gemini-2.5-flash",       # 1. Primary: Best balance of speed/smarts
+    "gemini-3-flash",         # 2. Backup: The new experimental model
+    "gemini-2.5-flash-lite"   # 3. Last Resort: High limits, very fast
 ]
 
 # Keys
 GEMINI_KEY = os.environ.get("GEMINI")
-# We don't have a separate Google Search API key, so we use Gemini to 'simulate' search 
-# by forcing it to retrieve factual data from its training.
 
-# Global Status Tracker (To show the user what's happening)
-# In a real app with many users, use a database. For this, a dictionary is fine.
+# Global Status Tracker
 current_status = {
     "message": "System Ready",
     "active_model": MODEL_ROSTER[0],
@@ -46,9 +43,11 @@ def call_swarm_intelligence(prompt, system_role, temperature=0.7):
     switches to the next one automatically.
     """
     
-    # Try every model in the list
+    # Try every model in the roster list
     for model_name in MODEL_ROSTER:
         current_status["active_model"] = model_name
+        
+        # We assume all these models use the v1beta API endpoint
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
         
         payload = {
@@ -57,25 +56,30 @@ def call_swarm_intelligence(prompt, system_role, temperature=0.7):
         }
 
         try:
+            # Send Request
             response = requests.post(url, json=payload)
             data = response.json()
 
-            # Check for Valid Answer
+            # 1. SUCCESS CHECK
             if "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
             
-            # Check for Error (Likely 429 - Too Many Requests)
+            # 2. FAILURE CHECK
+            # If we get here, the API returned an error (like 429 Too Many Requests)
             if "error" in data:
                 err_msg = data["error"].get("message", "Unknown error")
-                log_event(f"⚠️ {model_name} failed: {err_msg}")
-                log_event(f"📉 Downgrading to next model...")
-                continue # Try the next model in the loop
+                log_event(f"⚠️ {model_name} Error: {err_msg}")
+                log_event(f"📉 Switching to next model...")
+                # The loop continues to the next model in the list
+                continue 
 
         except Exception as e:
-            log_event(f"❌ Connection error with {model_name}. Switching...")
+            # Network error handling
+            log_event(f"❌ Network fail on {model_name}. Switching...")
             continue
 
-    log_event("💀 CRITICAL: All models are exhausted or down.")
+    # If the loop finishes and nothing worked:
+    log_event("💀 CRITICAL: All 3 models failed. Please wait a moment.")
     return None
 
 # --- 3. THE AGENTS ---
@@ -90,7 +94,8 @@ def run_router(prompt):
         "tts_needed is true if user asks for voice/speech/talking."
         "search_needed is true if user asks for real-world facts not in Roblox."
     )
-    result = call_swarm_intelligence(router_prompt, "You are a JSON router.")
+    # The Router uses lower temperature for precision
+    result = call_swarm_intelligence(router_prompt, "You are a JSON router.", temperature=0.1)
     try:
         return json.loads(result.replace("```json", "").replace("```", ""))
     except:
@@ -99,8 +104,6 @@ def run_router(prompt):
 def run_searcher(query):
     set_agent("Searcher")
     log_event(f"🌍 Scouring the web for: {query}...")
-    # Since we don't have a Serper Key, we use the Model's internal knowledge base
-    # but we frame it as a 'Search' to the user.
     return call_swarm_intelligence(
         query, 
         "You are a Research Engine. Retrieve specific factual technical details about this topic to help a coder."
@@ -133,7 +136,7 @@ def run_tts_engineer(prompt):
         "OR use 'Sound' objects if the user provided sound IDs. Create a function speak(text)."
     )
 
-# --- 4. THE WEB SERVER ---
+# --- 4. THE WEB SERVER (Hacker UI) ---
 
 @app.route('/')
 def home():
@@ -173,17 +176,11 @@ def home():
 
             <div id="console"></div>
 
-            <input type="text" id="prompt" placeholder="COMMAND: E.g., 'Search for sword sizes and build one that speaks'...">
+            <input type="text" id="prompt" placeholder="COMMAND: E.g., 'Make a talking NPC that knows the weather'...">
             <button onclick="sendCommand()">EXECUTE</button>
         </div>
 
         <script>
-            function log(msg) {
-                let c = document.getElementById("console");
-                c.innerHTML += `<div class='log-entry'>> ${msg}</div>`;
-                c.scrollTop = c.scrollHeight;
-            }
-
             function sendCommand() {
                 let p = document.getElementById("prompt").value;
                 if(!p) return;
@@ -202,9 +199,7 @@ def home():
                     document.getElementById("activeModel").innerText = data.active_model;
                     document.getElementById("activeAgent").innerText = data.agent.toUpperCase();
                     
-                    // Update logs if new ones exist
                     let c = document.getElementById("console");
-                    // Clear and rebuild logs (simple way)
                     c.innerHTML = "";
                     data.logs.forEach(l => {
                         c.innerHTML += `<div class='log-entry'>> ${l}</div>`;
@@ -229,7 +224,6 @@ def process_command():
     data = request.json
     prompt = data.get('prompt')
     
-    # Reset logs for new command
     current_status["logs"] = []
     log_event(f"📥 Received: {prompt}")
 
@@ -244,25 +238,24 @@ def process_command():
         if plan.get("search_needed"):
             search_result = run_searcher(prompt)
             if search_result:
-                context_data += f"\n--[SEARCH DATA found on Web]:\n-- {search_result}\n"
+                context_data += f"\n--[SEARCH DATA]:\n-- {search_result}\n"
                 log_event("✅ Search Data Acquired.")
 
-        # 3. BUILDER (Architect)
+        # 3. BUILDER
         if plan.get("build_needed"):
             build_code = run_architect(prompt)
             if build_code:
                 final_code += f"\n-- [ARCHITECT LAYER]\n{build_code}\n"
                 log_event("✅ 3D Model Drafted.")
 
-        # 4. TTS (If needed)
+        # 4. TTS
         if plan.get("tts_needed"):
             tts_code = run_tts_engineer(prompt)
             if tts_code:
                 final_code += f"\n-- [TTS AUDIO LAYER]\n{tts_code}\n"
                 log_event("✅ Speech Logic Synthesized.")
 
-        # 5. SCRIPTER (The Closer)
-        # The scripter takes the search data + build info and makes it work
+        # 5. SCRIPTER
         if plan.get("script_needed") or (not plan.get("build_needed")):
             script_code = run_scripter(prompt, context=context_data)
             if script_code:
@@ -270,13 +263,14 @@ def process_command():
                 log_event("✅ Core Logic Written.")
 
         # FINISH
-        final_code = final_code.replace("```lua", "").replace("```", "")
-        code_queue.append(final_code)
-        
-        set_agent("Done")
-        log_event("✨ All Tasks Complete. Ready for Roblox.")
+        if final_code:
+            final_code = final_code.replace("```lua", "").replace("```", "")
+            code_queue.append(final_code)
+            set_agent("Done")
+            log_event("✨ All Tasks Complete. Ready for Roblox.")
+        else:
+            log_event("⚠️ No code generated.")
 
-    # Run in background so UI updates immediately
     threading.Thread(target=worker).start()
     return jsonify({"success": True})
 
