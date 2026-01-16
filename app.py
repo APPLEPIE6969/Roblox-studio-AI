@@ -10,16 +10,17 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 GEMINI_KEY = os.environ.get("GEMINI")
 
-# WE ASSIGN JOBS TO YOUR SPECIFIC MODELS
-# 1. Lite = Fast Router
-MODEL_ROUTER = "gemini-2.5-flash-lite" 
-# 2. Flash = The Hard Worker (Drafter)
-MODEL_WORKER = "gemini-2.5-flash"
-# 3. 3-Flash = The Smart Boss (Reviewer)
-MODEL_BOSS = "gemini-3-flash" 
-
-# Fallback list in case the Boss is busy (Error 429)
-FALLBACK_CHAIN = [MODEL_BOSS, MODEL_WORKER, MODEL_ROUTER]
+# --- THE COMPLETE "OMNI-SWARM" ROSTER (Backend Logic) ---
+MODELS = {
+    "DIRECTOR": "gemini-3-flash",              # Logic & Review
+    "SEARCH": "gemini-1.5-pro",                # Research/Facts
+    "ROBOTICS": "gemini-robotics-er-1.5-preview", # Physics/Constraints
+    "DIALOG": "gemini-2.5-flash-native-audio-dialog", # Natural Speech Patterns
+    "AUDIO": "gemini-2.5-flash-tts",           # Sound Service Logic
+    "CREATIVE": "gemma-3-27b-it",              # Lore/Story
+    "WORKER": "gemini-2.5-flash",              # Building/General
+    "SCOUT": "gemini-2.5-flash-lite"           # Routing
+}
 
 # Status Tracking
 current_status = {
@@ -29,106 +30,112 @@ current_status = {
     "logs": []
 }
 
-def log_event(text):
-    print(text)
+def log_event(text, highlight=False):
+    # We add a prefix so the UI knows it's a server message
+    prefix = "✨ " if highlight else ""
+    print(f"{prefix}{text}")
     current_status["logs"].append(text)
     current_status["message"] = text
 
-# --- THE CORE AI ENGINE ---
-def call_specific_model(model_name, prompt, system_role):
-    """
-    Calls a specific model from your list. 
-    If it fails, it tries the next best one in the chain.
-    """
-    # Create a priority list starting with the requested model
-    priority_list = [model_name] + [m for m in FALLBACK_CHAIN if m != model_name]
+# --- UNIVERSAL CALLER ---
+def call_ai(model_key, prompt, system_role):
+    model_name = MODELS.get(model_key, MODELS["WORKER"])
+    current_status["active_model"] = model_name.upper()
     
-    for model in priority_list:
-        current_status["active_model"] = model
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        payload = { "contents": [{ "parts": [{ "text": f"{system_role}\n\nTask: {prompt}" }] }] }
-        
-        try:
-            r = requests.post(url, json=payload)
-            data = r.json()
-            
-            # Success?
-            if "candidates" in data: 
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            
-            # Error? (Rate limit / overload)
-            if "error" in data:
-                log_event(f"⚠️ {model} Busy/Error. Switching to backup...")
-                continue # Try next in list
-                
-        except Exception as e:
-            continue
-            
-    return None
-
-# --- THE SELF-REFLECTION LOOP (The "Brain") ---
-def generate_with_reflection(prompt, role, deep_think=False):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
     
-    # 1. First Draft -> Uses 2.5 Flash (The Worker)
-    log_event(f"📝 Drafting with {MODEL_WORKER}...")
-    draft_code = call_specific_model(MODEL_WORKER, prompt, role)
-    
-    if not deep_think or not draft_code:
-        return draft_code
+    payload = {
+        "contents": [{ "parts": [{ "text": f"{system_role}\n\nSpecific Task: {prompt}" }] }]
+    }
 
-    # 2. The Critique -> Uses 3.0 Flash (The Boss)
-    log_event(f"🤔 Deep Think: {MODEL_BOSS} is reviewing the code...")
-    critique_prompt = (
-        f"You are a Senior Roblox Code Reviewer. Look at this Lua code:\n\n{draft_code}\n\n"
-        f"The user asked for: '{prompt}'.\n"
-        "Identify logic errors, physics issues, or deprecated methods. "
-        "If it is perfect, reply ONLY: 'PERFECT'. "
-        "Otherwise, list the specific fixes needed."
-    )
-    critique = call_specific_model(MODEL_BOSS, critique_prompt, "You are a critical expert reviewer.")
+    try:
+        r = requests.post(url, json=payload)
+        data = r.json()
+        if "candidates" in data:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        elif "error" in data:
+            log_event(f"⚠️ {model_name} Busy/Error: {data['error']['message']}. Switching to Worker...")
+            return call_ai("WORKER", prompt, system_role)
+    except Exception as e:
+        log_event(f"❌ Connection Error on {model_name}: {str(e)}")
+        return None
 
-    if critique and "PERFECT" in critique.upper():
-        log_event("✅ Deep Think: Code approved by Boss.")
-        return draft_code
-    
-    # 3. The Refinement -> Uses 3.0 Flash (The Boss fixes it)
-    log_event(f"🔧 Deep Think: Optimizing logic based on review...")
-    fix_prompt = (
-        f"Original Request: {prompt}\n"
-        f"Draft Code: {draft_code}\n"
-        f"Reviewer Feedback: {critique}\n\n"
-        "Rewrite the Lua code completely to fix these issues. Return ONLY the code."
-    )
-    final_code = call_specific_model(MODEL_BOSS, fix_prompt, role)
-    return final_code
-
-# --- THE AGENTS ---
-def run_architect(prompt, deep_think):
-    current_status["agent"] = "Architect"
-    instruction = (
-        "You are a Roblox Builder. You cannot upload meshes. "
-        "Build the requested object using ONLY Instance.new('Part'). "
-        "Set Size, Position, Color, Anchored = true. Group into a Model. "
-        "Do NOT use 'smoothplastic' as a material enum (use Enum.Material.Plastic). "
-        "Return ONLY Lua."
-    )
-    return generate_with_reflection(prompt, instruction, deep_think)
-
-def run_scripter(prompt, context, deep_think):
-    current_status["agent"] = "Scripter"
-    instruction = (
-        f"You are a Roblox Scripter. Write valid Lua code. Context: {context}. "
-        "Ensure all variables are defined. Return ONLY Lua."
-    )
-    return generate_with_reflection(prompt, instruction, deep_think)
+# --- SPECIALIST AGENTS (The Logic) ---
 
 def run_router(prompt):
-    # Uses 2.5 Flash Lite (The Scout) for speed
-    instruction = "Decide if this request needs a Build, a Script, or Both. JSON format."
-    # (Simplified for this version to just return true/false context)
-    return True # We default to doing both for robustness
+    log_event(f"🔍 [SCOUT] Analyzing request: '{prompt}'...")
+    instruction = (
+        "Analyze request. Return JSON with booleans:\n"
+        "{ \"needs_search\": bool (true if asking for real world facts/specific items),\n"
+        "\"needs_physics\": bool (true if moving parts/motors),\n"
+        "\"needs_lore\": bool (true if story),\n"
+        "\"needs_dialog\": bool (true if NPCs talking),\n"
+        "\"needs_sound\": bool (true if sfx/music),\n"
+        "\"needs_build\": bool }"
+    )
+    res = call_ai("SCOUT", instruction + f"\nRequest: {prompt}", "You are a JSON Router.")
+    try:
+        clean = res.replace("```json", "").replace("```", "")
+        return json.loads(clean)
+    except:
+        return {"needs_build": True, "needs_search": True} 
 
-# --- WEB SERVER (Polished UI) ---
+def run_searcher(query):
+    log_event(f"🌍 [SEARCHER] Retrieving data on: {query}...")
+    instruction = "You are a Research Engine. Provide technical details (Color RGB, Size, Key Parts) for a Roblox Builder."
+    return call_ai("SEARCH", query, instruction)
+
+def run_robotics_engineer(prompt, context):
+    log_event("⚙️ [ROBOTICS] Calculating constraints...")
+    instruction = (
+        f"You are a Robotics Engineer. Context: {context}. "
+        "Write Roblox Lua for mechanical parts using HingeConstraint/Motor6D. Return ONLY Lua."
+    )
+    return call_ai("ROBOTICS", prompt, instruction)
+
+def run_creative_writer(prompt):
+    log_event("📖 [GEMMA] Drafting lore...")
+    instruction = "You are a Creative Writer. Write a Lua script that creates Lore StringValues. Return ONLY Lua."
+    return call_ai("CREATIVE", prompt, instruction)
+
+def run_dialogue_coach(prompt):
+    log_event("🗣️ [NATIVE-DIALOG] Formatting speech patterns...")
+    instruction = (
+        "You are a Dialogue Coach. Use your training in natural audio patterns to write a Lua Table of dialogue. "
+        "Include fields for 'Text', 'Delay', and 'Emotion'. "
+        "Make the text feel natural and conversational. Return ONLY Lua."
+    )
+    return call_ai("DIALOG", prompt, instruction)
+
+def run_audio_engineer(prompt):
+    log_event("🔊 [TTS-AUDIO] Designing soundscape...")
+    instruction = "You are an Audio Director. Write Lua using TextChatService and SoundService. Return ONLY Lua."
+    return call_ai("AUDIO", prompt, instruction)
+
+def run_architect(prompt, context):
+    log_event("🏗️ [WORKER] Building structure...")
+    instruction = (
+        f"You are a Builder. Context: {context}. "
+        "Build using Instance.new('Part'). Group into a Model. Return ONLY Lua."
+    )
+    return call_ai("WORKER", prompt, instruction)
+
+# --- BOSS REVIEW ---
+def run_boss_review(code, prompt):
+    log_event("🧐 [DIRECTOR] Reviewing code...")
+    critique = call_ai("DIRECTOR", 
+        f"Review this code:\n{code}\nRequest: {prompt}", 
+        "Strict Code Reviewer. Reply 'PERFECT' or list errors."
+    )
+    
+    if "PERFECT" not in critique.upper():
+        log_event("🔧 [DIRECTOR] Fixing issues...")
+        return call_ai("DIRECTOR", f"Fix these errors:\n{critique}\n\nCode:\n{code}", "Fix the code. Return ONLY Lua.")
+    
+    log_event("✅ [DIRECTOR] Approved.")
+    return code
+
+# --- WEB SERVER (The User's UI) ---
 code_queue = []
 
 @app.route('/')
@@ -400,18 +407,41 @@ def process():
     current_status["logs"] = []
 
     def task():
-        # 1. Build
-        build_code = run_architect(prompt, deep_think)
-        # 2. Script
-        script_code = run_scripter(prompt, "Object is built.", deep_think)
+        final_code = ""
+        context_data = ""
         
-        final = ""
-        if build_code: final += f"\n{build_code}\n"
-        if script_code: final += f"\n{script_code}\n"
+        # 1. SCOUT
+        plan = run_router(prompt)
         
-        clean = final.replace("```lua", "").replace("```", "")
+        # 2. SEARCH
+        if plan.get("needs_search"):
+            context_data = run_searcher(prompt)
+
+        # 3. SPECIALISTS
+        if plan.get("needs_physics"):
+            final_code += f"\n-- [PHYSICS]\n{run_robotics_engineer(prompt, context_data)}\n"
+        elif plan.get("needs_build"):
+            final_code += f"\n-- [BUILD]\n{run_architect(prompt, context_data)}\n"
+
+        if plan.get("needs_lore"):
+            final_code += f"\n-- [LORE]\n{run_creative_writer(prompt)}\n"
+        
+        if plan.get("needs_dialog"):
+            final_code += f"\n-- [DIALOGUE]\n{run_dialogue_coach(prompt)}\n"
+
+        if plan.get("needs_sound"):
+            final_code += f"\n-- [AUDIO]\n{run_audio_engineer(prompt)}\n"
+
+        # 4. GENERAL LOGIC
+        final_code += f"\n-- [LOGIC]\n{call_ai('WORKER', prompt, f'Main Script. Context: {context_data}. Object built.')}\n"
+
+        # 5. BOSS REVIEW
+        if deep_think:
+            final_code = run_boss_review(final_code, prompt)
+        
+        clean = final_code.replace("```lua", "").replace("```", "")
         code_queue.append(clean)
-        log_event("✨ Sequence Complete. Executing in Studio.")
+        log_event("✨ Sequence Complete.")
 
     threading.Thread(target=task).start()
     return jsonify({"success": True})
