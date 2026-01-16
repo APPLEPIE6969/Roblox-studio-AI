@@ -11,18 +11,19 @@ GEMINI_KEY = os.environ.get("GEMINI")
 
 # --- MODEL ROSTER ---
 MODELS = {
-    "BRAIN": "gemini-3-flash-preview",                    # Text Logic
-    "NATIVE_AUDIO": "gemini-2.5-flash-native-audio-dialog", # Voice Logic
-    "NEURAL_TTS": "gemini-2.5-flash-tts"          # Fallback TTS
+    "GEMINI": "gemini-3-flash-preview",                   # Logic / Brain
+    "GEMMA": "gemma-3-27b-it",                    # Open Model / Creative
+    "NATIVE_AUDIO": "gemini-2.5-flash-native-audio-dialog", # Voice
+    "NEURAL_TTS": "gemini-2.5-flash-tts"          # TTS Fallback
 }
 
-# --- HELPER: GEMINI TEXT-TO-SPEECH ---
+# --- HELPER: TTS ---
 def generate_neural_speech(text):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NEURAL_TTS']}:generateContent?key={GEMINI_KEY}"
     payload = { "contents": [{ "parts": [{ "text": text }] }] }
     try:
-        response = requests.post(url, json=payload)
-        data = response.json()
+        r = requests.post(url, json=payload)
+        data = r.json()
         if "candidates" in data:
             for part in data["candidates"][0]["content"]["parts"]:
                 if "inline_data" in part: return part["inline_data"]["data"]
@@ -30,23 +31,40 @@ def generate_neural_speech(text):
     return None
 
 # --- MAIN AI CALLER ---
-def call_ai(mode, prompt=None, audio_data=None):
-    # 1. TEXT MODE (Gemini 3.0 - Silent)
+def call_ai(mode, model_id=None, prompt=None, audio_data=None, image_data=None):
+    
+    # 1. TEXT/IMAGE MODE
     if mode == "text":
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['BRAIN']}:generateContent?key={GEMINI_KEY}"
-        payload = { "contents": [{ "parts": [{ "text": f"You are a helpful assistant. User says: {prompt}" }] }] }
+        # Select the requested model (Gemini or Gemma)
+        target_model = MODELS.get(model_id, MODELS["GEMINI"])
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={GEMINI_KEY}"
+        
+        parts = [{ "text": f"User: {prompt}" }]
+        
+        # Add Image if present
+        if image_data:
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg", # Assumes JPEG/PNG
+                    "data": image_data
+                }
+            })
+
+        payload = { "contents": [{ "parts": parts }] }
+        
         try:
             r = requests.post(url, json=payload)
             return {"text": r.json()["candidates"][0]["content"]["parts"][0]["text"], "audio": None}
-        except: return {"text": "Connection error.", "audio": None}
+        except Exception as e: 
+            return {"text": f"Error with {target_model}: {str(e)}", "audio": None}
 
-    # 2. VOICE MODE (Native Audio 2.5 - Speaks)
+    # 2. VOICE MODE (Native Audio 2.5)
     if mode == "voice":
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NATIVE_AUDIO']}:generateContent?key={GEMINI_KEY}"
         payload = {
             "contents": [{
                 "parts": [
-                    { "text": "Listen to this audio. Respond naturally with Audio." },
+                    { "text": "Listen and respond." },
                     { "inline_data": { "mime_type": "audio/mp3", "data": audio_data } }
                 ]
             }]
@@ -54,7 +72,7 @@ def call_ai(mode, prompt=None, audio_data=None):
         try:
             r = requests.post(url, json=payload)
             data = r.json()
-            resp_text = "Audio Message Received."
+            resp_text = "Audio Message."
             resp_audio = None
             
             if "candidates" in data:
@@ -65,7 +83,7 @@ def call_ai(mode, prompt=None, audio_data=None):
 
             if not resp_audio: resp_audio = generate_neural_speech(resp_text)
             return {"text": resp_text, "audio": resp_audio}
-        except Exception as e: return {"text": f"Error: {str(e)}", "audio": None}
+        except Exception as e: return {"text": str(e), "audio": None}
 
 # --- WEB SERVER ---
 
@@ -75,7 +93,7 @@ def home():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>Omni-Chat</title>
+        <title>Omni-Chat Pro</title>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
         <meta name="theme-color" content="#050508">
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
@@ -86,150 +104,99 @@ def home():
                 --header-bg: rgba(20, 20, 30, 0.9);
                 --glass-border: rgba(255, 255, 255, 0.08);
                 --primary: #00f2ea;
-                --primary-dark: #00a8a2;
                 --secondary: #7000ff;
+                --gemma: #ff0055;
                 --text: #ffffff;
-                --text-dim: #8888aa;
-                --user-bubble: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+                --user-bubble: linear-gradient(135deg, var(--primary) 0%, #00a8a2 100%);
                 --ai-bubble: rgba(255, 255, 255, 0.05);
             }
 
             * { box-sizing: border-box; margin: 0; padding: 0; outline: none; -webkit-tap-highlight-color: transparent; }
 
             body {
-                background: var(--bg);
-                color: var(--text);
-                font-family: 'Outfit', sans-serif;
-                height: 100dvh; /* Full mobile height */
-                display: flex;
-                flex-direction: column;
-                overflow: hidden;
-                position: relative;
+                background: var(--bg); color: var(--text); font-family: 'Outfit', sans-serif;
+                height: 100dvh; display: flex; flex-direction: column; overflow: hidden; position: relative;
             }
 
-            /* --- ANIMATED BACKGROUND --- */
-            .orb { position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.3; z-index: -1; animation: float 10s infinite alternate ease-in-out; }
+            /* --- BACKGROUND --- */
+            .orb { position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.3; z-index: -1; animation: float 10s infinite alternate; }
             .orb-1 { width: 400px; height: 400px; background: var(--secondary); top: -10%; left: -10%; }
             .orb-2 { width: 300px; height: 300px; background: var(--primary); bottom: -10%; right: -10%; animation-delay: 2s; }
             @keyframes float { 0% { transform: translate(0,0); } 100% { transform: translate(30px, 30px); } }
 
-            /* --- HEADER --- */
+            /* --- HEADER & MODEL SWITCHER --- */
             .header {
-                padding: 15px 20px;
-                background: var(--header-bg);
-                backdrop-filter: blur(20px);
-                border-bottom: 1px solid var(--glass-border);
-                z-index: 10;
+                padding: 15px 20px; background: var(--header-bg); backdrop-filter: blur(20px);
+                border-bottom: 1px solid var(--glass-border); z-index: 10;
                 display: flex; align-items: center; justify-content: space-between;
             }
-            .brand { display: flex; align-items: center; gap: 10px; }
-            h1 { font-size: 18px; font-weight: 700; margin: 0; background: linear-gradient(135deg, #fff, #aaa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-            .dot { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; box-shadow: 0 0 10px var(--primary); animation: pulse 2s infinite; }
-            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } }
+            .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+            .dot { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; box-shadow: 0 0 10px var(--primary); }
             
-            .badges { display: flex; gap: 5px; }
-            .badge { font-size: 9px; background: rgba(0, 242, 234, 0.1); color: var(--primary); padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(0, 242, 234, 0.2); font-weight: 600; text-transform: uppercase; }
-
-            /* --- CHAT AREA --- */
-            .chat-container {
-                flex-grow: 1;
-                padding: 20px;
-                overflow-y: auto;
-                display: flex;
-                flex-direction: column;
-                gap: 15px;
-                scroll-behavior: smooth;
+            .switcher {
+                background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border);
+                border-radius: 20px; padding: 3px; display: flex;
             }
-            
-            /* Scrollbar styling */
+            .model-btn {
+                padding: 6px 12px; border-radius: 16px; font-size: 11px; font-weight: 600;
+                color: #888; cursor: pointer; transition: 0.3s;
+            }
+            .model-btn.active-gemini { background: rgba(0, 242, 234, 0.2); color: var(--primary); }
+            .model-btn.active-gemma { background: rgba(255, 0, 85, 0.2); color: var(--gemma); }
+
+            /* --- CHAT --- */
+            .chat-container {
+                flex-grow: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; scroll-behavior: smooth;
+            }
             .chat-container::-webkit-scrollbar { width: 4px; }
             .chat-container::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
 
             .message {
-                max-width: 80%;
-                padding: 14px 18px;
-                border-radius: 18px;
-                font-size: 15px;
-                line-height: 1.5;
-                position: relative;
-                animation: popIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-                word-wrap: break-word;
+                max-width: 80%; padding: 14px 18px; border-radius: 18px; font-size: 15px; line-height: 1.5;
+                position: relative; word-wrap: break-word; animation: popIn 0.2s ease;
             }
-
-            .user-msg {
-                align-self: flex-end;
-                background: var(--user-bubble);
-                color: #000;
-                font-weight: 500;
-                border-bottom-right-radius: 4px;
-                box-shadow: 0 5px 15px rgba(0, 242, 234, 0.15);
-            }
-
-            .ai-msg {
-                align-self: flex-start;
-                background: var(--ai-bubble);
-                color: #eee;
-                border: 1px solid var(--glass-border);
-                border-bottom-left-radius: 4px;
-            }
-
-            .ai-msg.thinking { color: var(--text-dim); font-style: italic; font-size: 13px; padding: 10px 15px; }
-
-            @keyframes popIn { from { opacity: 0; transform: translateY(20px) scale(0.9); } to { opacity: 1; transform: translateY(0) scale(1); } }
+            .user-msg { align-self: flex-end; background: var(--user-bubble); color: #000; font-weight: 500; border-bottom-right-radius: 4px; }
+            .ai-msg { align-self: flex-start; background: var(--ai-bubble); color: #eee; border: 1px solid var(--glass-border); border-bottom-left-radius: 4px; }
+            .img-preview { max-width: 100%; border-radius: 10px; margin-top: 5px; display: block; border: 1px solid rgba(0,0,0,0.2); }
+            @keyframes popIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
             /* --- INPUT AREA --- */
             .input-area {
-                padding: 15px;
-                background: var(--header-bg);
-                backdrop-filter: blur(20px);
-                border-top: 1px solid var(--glass-border);
-                display: flex;
-                gap: 10px;
-                align-items: center;
+                padding: 15px; background: var(--header-bg); backdrop-filter: blur(20px);
+                border-top: 1px solid var(--glass-border); display: flex; gap: 10px; align-items: flex-end;
                 padding-bottom: max(15px, env(safe-area-inset-bottom));
             }
 
-            input {
-                flex-grow: 1;
-                background: rgba(0,0,0,0.4);
-                border: 1px solid var(--glass-border);
-                padding: 14px 20px;
-                border-radius: 25px;
-                color: #fff;
-                font-size: 16px; /* Prevents Zoom */
-                font-family: 'Outfit', sans-serif;
-                transition: 0.3s;
-            }
-            input:focus { border-color: var(--primary); box-shadow: 0 0 15px rgba(0, 242, 234, 0.1); }
-
-            /* Buttons */
-            .icon-btn {
-                width: 50px; height: 50px;
-                border-radius: 50%;
-                border: 1px solid var(--glass-border);
-                background: rgba(255,255,255,0.05);
-                color: var(--text-dim);
-                font-size: 20px;
-                cursor: pointer;
-                display: flex; align-items: center; justify-content: center;
-                transition: 0.2s;
-                flex-shrink: 0;
-            }
+            .input-wrapper { flex-grow: 1; position: relative; }
             
-            /* Mic State */
-            #micBtn:hover { border-color: var(--primary); color: var(--primary); background: rgba(0, 242, 234, 0.05); }
-            #micBtn.recording { 
-                background: rgba(255, 0, 85, 0.15); 
-                border-color: #ff0055; 
-                color: #ff0055; 
-                box-shadow: 0 0 15px rgba(255, 0, 85, 0.3);
-                animation: breathe 1.5s infinite; 
+            textarea {
+                width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border);
+                padding: 12px 15px; border-radius: 20px; color: #fff; font-size: 16px; font-family: 'Outfit', sans-serif;
+                resize: none; height: 48px; max-height: 120px; transition: 0.3s;
             }
-            @keyframes breathe { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+            textarea:focus { border-color: var(--primary); }
 
-            /* Send State */
-            #sendBtn { background: var(--primary); color: #000; border: none; }
-            #sendBtn:active { transform: scale(0.9); }
+            .icon-btn {
+                width: 48px; height: 48px; border-radius: 50%; border: 1px solid var(--glass-border);
+                background: rgba(255,255,255,0.05); color: #aaa; font-size: 18px;
+                display: flex; align-items: center; justify-content: center; transition: 0.2s; cursor: pointer;
+            }
+            .icon-btn:hover { color: var(--primary); border-color: var(--primary); }
+            
+            #micBtn.recording { color: #ff0055; border-color: #ff0055; animation: breathe 1.5s infinite; }
+            @keyframes breathe { 0% { box-shadow: 0 0 0 0 rgba(255, 0, 85, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(255, 0, 85, 0); } }
+
+            /* --- IMAGE PREVIEW OVERLAY --- */
+            #imageUploadPreview {
+                position: absolute; bottom: 60px; left: 15px; width: 60px; height: 60px;
+                border-radius: 10px; object-fit: cover; border: 2px solid var(--primary);
+                display: none; box-shadow: 0 5px 20px rgba(0,0,0,0.5); z-index: 20; background: #000;
+            }
+            .remove-img {
+                position: absolute; top: -8px; right: -8px; background: red; color: white;
+                width: 18px; height: 18px; border-radius: 50%; font-size: 12px;
+                display: flex; align-items: center; justify-content: center; cursor: pointer;
+            }
 
         </style>
     </head>
@@ -239,30 +206,37 @@ def home():
         <div class="orb orb-2"></div>
 
         <div class="header">
-            <div class="brand">
-                <div class="dot"></div>
-                <h1>Omni-Chat</h1>
-            </div>
-            <div class="badges">
-                <span class="badge">Gemini 3.0</span>
-                <span class="badge">Live Audio</span>
+            <div class="brand"><div class="dot"></div> Omni-Chat</div>
+            <div class="switcher">
+                <div class="model-btn active-gemini" id="btnGemini" onclick="setModel('GEMINI')">Gemini 3.0</div>
+                <div class="model-btn" id="btnGemma" onclick="setModel('GEMMA')">Gemma 3</div>
             </div>
         </div>
 
         <div class="chat-container" id="chat">
-            <div class="message ai-msg">
-                System Online. <br>
-                Text me for silent logic.<br>
-                Speak to me for conversation.
-            </div>
+            <div class="message ai-msg">System Online. Select a model and start chatting.</div>
         </div>
 
         <div class="input-area">
+            <!-- File Input -->
+            <input type="file" id="fileInput" accept="image/*" style="display: none;" onchange="handleFile(this)">
+            <div id="previewContainer" style="display:none;">
+                <img id="imageUploadPreview">
+                <div class="remove-img" onclick="clearImage()">×</div>
+            </div>
+
+            <button class="icon-btn" onclick="document.getElementById('fileInput').click()">
+                <i class="fa-solid fa-paperclip"></i>
+            </button>
+
+            <div class="input-wrapper">
+                <textarea id="prompt" placeholder="Message..." rows="1"></textarea>
+            </div>
+
             <button class="icon-btn" id="micBtn" ontouchstart="startRec()" ontouchend="stopRec()" onmousedown="startRec()" onmouseup="stopRec()">
                 <i class="fa-solid fa-microphone"></i>
             </button>
-            <input type="text" id="prompt" placeholder="Message..." autocomplete="off">
-            <button class="icon-btn" id="sendBtn" onclick="sendText()">
+            <button class="icon-btn" style="background: var(--primary); color: #000; border: none;" onclick="sendText()">
                 <i class="fa-solid fa-arrow-up"></i>
             </button>
         </div>
@@ -270,84 +244,114 @@ def home():
         <audio id="audioPlayer" style="display:none"></audio>
 
         <script>
-            function addMsg(text, type, isTemp=false) {
+            let currentModel = 'GEMINI';
+            let currentImageBase64 = null;
+
+            function setModel(model) {
+                currentModel = model;
+                document.getElementById('btnGemini').className = model === 'GEMINI' ? 'model-btn active-gemini' : 'model-btn';
+                document.getElementById('btnGemma').className = model === 'GEMMA' ? 'model-btn active-gemma' : 'model-btn';
+            }
+
+            function addMsg(text, type, img=null) {
                 let div = document.createElement("div");
                 div.className = "message " + type;
-                if(isTemp) div.id = "tempMsg";
-                div.innerText = text;
+                
+                if (img) {
+                    let i = document.createElement("img");
+                    i.src = img;
+                    i.className = "img-preview";
+                    div.appendChild(i);
+                }
+                
+                let t = document.createElement("div");
+                t.innerText = text;
+                div.appendChild(t);
+                
                 let container = document.getElementById("chat");
                 container.appendChild(div);
                 container.scrollTop = container.scrollHeight;
             }
 
-            function removeTemp() {
-                let temp = document.getElementById("tempMsg");
-                if(temp) temp.remove();
+            // --- IMAGE HANDLING ---
+            function handleFile(input) {
+                if (input.files && input.files[0]) {
+                    let reader = new FileReader();
+                    reader.onload = function(e) {
+                        currentImageBase64 = e.target.result.split(',')[1]; // Store Base64
+                        let preview = document.getElementById('imageUploadPreview');
+                        preview.src = e.target.result;
+                        document.getElementById('previewContainer').style.display = 'block';
+                        preview.style.display = 'block';
+                    }
+                    reader.readAsDataURL(input.files[0]);
+                }
+            }
+
+            function clearImage() {
+                currentImageBase64 = null;
+                document.getElementById('fileInput').value = "";
+                document.getElementById('previewContainer').style.display = 'none';
             }
 
             // --- TEXT MODE ---
-            function sendText() {
-                let p = document.getElementById("prompt");
-                let txt = p.value.trim();
-                if(!txt) return;
+            const promptInput = document.getElementById("prompt");
+            promptInput.addEventListener("input", function() { this.style.height = "auto"; this.style.height = (this.scrollHeight) + "px"; });
 
-                addMsg(txt, "user-msg");
-                p.value = "";
-                addMsg("Thinking...", "ai-msg thinking", true);
+            function sendText() {
+                let txt = promptInput.value.trim();
+                if(!txt && !currentImageBase64) return;
+
+                // Show User Message (with image if exists)
+                let imgSrc = currentImageBase64 ? "data:image/jpeg;base64," + currentImageBase64 : null;
+                addMsg(txt, "user-msg", imgSrc);
+                
+                promptInput.value = "";
+                promptInput.style.height = "48px";
+                
+                let payload = { prompt: txt, model: currentModel };
+                if (currentImageBase64) {
+                    payload.image = currentImageBase64;
+                    clearImage(); // Clear after sending
+                }
 
                 fetch("/process_text", {
                     method: "POST", headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({prompt: txt})
+                    body: JSON.stringify(payload)
                 }).then(r=>r.json()).then(d => {
-                    removeTemp();
                     addMsg(d.text, "ai-msg");
                 });
             }
 
             // --- VOICE MODE ---
             let recorder, chunks = [];
-
             async function startRec() {
-                let btn = document.getElementById("micBtn");
-                btn.classList.add("recording");
+                document.getElementById("micBtn").classList.add("recording");
                 try {
                     let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     recorder = new MediaRecorder(stream);
                     chunks = [];
                     recorder.ondataavailable = e => chunks.push(e.data);
                     recorder.start();
-                } catch(e) { 
-                    btn.classList.remove("recording");
-                    alert("Microphone denied."); 
-                }
+                } catch(e) { alert("Mic Error"); }
             }
 
             function stopRec() {
                 document.getElementById("micBtn").classList.remove("recording");
                 if(!recorder) return;
-                
-                addMsg("Listening...", "user-msg", true); // Temp user msg
                 recorder.stop();
-                
                 recorder.onstop = () => {
                     let blob = new Blob(chunks, { type: 'audio/webm' });
                     let reader = new FileReader();
                     reader.readAsDataURL(blob);
                     reader.onloadend = () => {
                         let b64 = reader.result.split(',')[1];
-                        
-                        // Switch temp user msg to 'Processing'
-                        let temp = document.getElementById("tempMsg");
-                        if(temp) temp.innerText = "Processing Audio...";
-
+                        addMsg("🎤 Voice Input", "user-msg");
                         fetch("/process_voice", {
                             method: "POST", headers: {"Content-Type": "application/json"},
                             body: JSON.stringify({audio: b64})
                         }).then(r=>r.json()).then(d => {
-                            removeTemp(); // Remove 'Processing'
-                            addMsg("🎤 Audio Input", "user-msg"); // Static marker
                             addMsg(d.text, "ai-msg");
-                            
                             if(d.audio) {
                                 let aud = document.getElementById("audioPlayer");
                                 aud.src = "data:audio/mp3;base64," + d.audio;
@@ -366,9 +370,13 @@ def home():
 
 @app.route('/process_text', methods=['POST'])
 def process_text():
-    p = request.json.get('prompt')
-    res = call_ai("text", prompt=p)
-    return jsonify({"text": res["text"]}) # No Audio
+    data = request.json
+    p = data.get('prompt', '')
+    m = data.get('model', 'GEMINI') # Default to Gemini
+    img = data.get('image') # Base64 Image
+    
+    res = call_ai("text", model_id=m, prompt=p, image_data=img)
+    return jsonify({"text": res["text"]})
 
 @app.route('/process_voice', methods=['POST'])
 def process_voice():
