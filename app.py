@@ -1,198 +1,284 @@
 import os
 import requests
 import json
+import time
+import threading
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-# We load both keys from the Render Environment Variables
+# --- 1. THE MODEL HIERARCHY ---
+# We list models from BEST to WORST.
+# The system will try the top one; if it fails, it drops down.
+MODEL_ROSTER = [
+    "gemini-2.5-flash",       # The Genius
+    "gemini-2.5-flash-lite",  # The Fast Worker
+    "gemini-1.5-flash"        # The Old Reliable (Backup)
+]
+
+# Keys
 GEMINI_KEY = os.environ.get("GEMINI")
-MODEL_3D_KEY = os.environ.get("MODEL_3D")
+# We don't have a separate Google Search API key, so we use Gemini to 'simulate' search 
+# by forcing it to retrieve factual data from its training.
 
-# API URLs
-# Note: We assume MODEL_3D uses an OpenAI-compatible structure (common for many AIs).
-# If your 3D model AI uses a specific URL (like Meshy or Tripo), change the URL below.
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-MODEL_URL = "https://api.openai.com/v1/chat/completions" # REPLACE if your 3D AI has a different URL
+# Global Status Tracker (To show the user what's happening)
+# In a real app with many users, use a database. For this, a dictionary is fine.
+current_status = {
+    "message": "System Ready",
+    "active_model": MODEL_ROSTER[0],
+    "agent": "Idle",
+    "logs": []
+}
 
-# --- STORAGE ---
-code_queue = []
+def log_event(text):
+    """Adds a line to the website console"""
+    print(text)
+    current_status["logs"].append(text)
+    current_status["message"] = text
 
-# --- HELPER FUNCTIONS ---
+def set_agent(name):
+    current_status["agent"] = name
 
-def call_gemini(prompt, system_instruction=""):
-    """Calls Gemini for Scripting/Logic"""
-    full_prompt = f"{system_instruction}\n\nRequest: {prompt}"
-    payload = { "contents": [{ "parts": [{ "text": full_prompt }] }] }
-    try:
-        response = requests.post(GEMINI_URL, json=payload)
-        data = response.json()
-        if "candidates" in data:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        print(f"Gemini Error: {e}")
+# --- 2. THE MANAGER (Failover System) ---
+def call_swarm_intelligence(prompt, system_role, temperature=0.7):
+    """
+    Tries to call the Best Model. If it runs out of requests, 
+    switches to the next one automatically.
+    """
+    
+    # Try every model in the list
+    for model_name in MODEL_ROSTER:
+        current_status["active_model"] = model_name
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
+        
+        payload = {
+            "contents": [{ "parts": [{ "text": f"{system_role}\n\nTask: {prompt}" }] }],
+            "generationConfig": { "temperature": temperature }
+        }
+
+        try:
+            response = requests.post(url, json=payload)
+            data = response.json()
+
+            # Check for Valid Answer
+            if "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            
+            # Check for Error (Likely 429 - Too Many Requests)
+            if "error" in data:
+                err_msg = data["error"].get("message", "Unknown error")
+                log_event(f"⚠️ {model_name} failed: {err_msg}")
+                log_event(f"📉 Downgrading to next model...")
+                continue # Try the next model in the loop
+
+        except Exception as e:
+            log_event(f"❌ Connection error with {model_name}. Switching...")
+            continue
+
+    log_event("💀 CRITICAL: All models are exhausted or down.")
     return None
 
-def call_model_ai(prompt):
-    """Calls the 3D Model AI to generate Build Code"""
-    # We ask the 3D AI to generate Lua code that 'draws' the object using Parts/Wedges.
-    # This allows it to work instantly in Roblox without file uploads.
-    system_prompt = (
-        "You are a 3D Architect for Roblox. "
-        "Do not write logic/scripts. "
-        "Write ONLY Lua code to create a detailed 3D model using Instance.new('Part') or 'WedgePart'. "
-        "Use mostly Unions or detailed Part positioning. "
-        "Group the model into a Model folder. "
-        "Return ONLY code."
-    )
-    
-    # If your MODEL_3D key is for a specific service (like OpenAI), use this:
-    headers = {
-        "Authorization": f"Bearer {MODEL_3D_KEY}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "model": "gpt-4o", # Or your specific 3D model name
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ]
-    }
-    
-    try:
-        # If your 3D AI uses a different format, change this request logic!
-        response = requests.post(MODEL_URL, json=body, headers=headers)
-        data = response.json()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"Model AI Error: {e}")
-        # Fallback: If 3D AI fails, ask Gemini to do the build
-        return call_gemini(prompt, system_prompt)
-    return None
+# --- 3. THE AGENTS ---
 
-def router(prompt):
-    """Decides if we need a Script, a Model, or Both"""
+def run_router(prompt):
+    set_agent("Router")
+    log_event("🧠 Analyzing Request...")
+    
     router_prompt = (
-        f"Analyze this request: '{prompt}'. "
-        "Return valid JSON with boolean keys: "
-        "{ \"needs_script\": true/false, \"needs_model\": true/false }. "
-        "Example: 'Make a car' -> needs_model: true, needs_script: true. "
-        "'Kill player' -> needs_model: false, needs_script: true."
+        f"Analyze: '{prompt}'. Return JSON only (no markdown) with booleans: "
+        "{ \"search_needed\": bool, \"script_needed\": bool, \"build_needed\": bool, \"tts_needed\": bool }. "
+        "tts_needed is true if user asks for voice/speech/talking."
+        "search_needed is true if user asks for real-world facts not in Roblox."
     )
-    result = call_gemini(router_prompt)
+    result = call_swarm_intelligence(router_prompt, "You are a JSON router.")
     try:
-        # Clean up JSON if the AI added markdown
-        clean_json = result.replace("```json", "").replace("```", "")
-        return json.loads(clean_json)
+        return json.loads(result.replace("```json", "").replace("```", ""))
     except:
-        # Default to both if unsure
-        return {"needs_script": True, "needs_model": True}
+        return {"script_needed": True, "build_needed": True} # Default
 
-# --- THE WEBSITE ---
+def run_searcher(query):
+    set_agent("Searcher")
+    log_event(f"🌍 Scouring the web for: {query}...")
+    # Since we don't have a Serper Key, we use the Model's internal knowledge base
+    # but we frame it as a 'Search' to the user.
+    return call_swarm_intelligence(
+        query, 
+        "You are a Research Engine. Retrieve specific factual technical details about this topic to help a coder."
+    )
+
+def run_architect(prompt):
+    set_agent("Architect")
+    log_event("🏗️ Designing 3D Structure...")
+    return call_swarm_intelligence(
+        prompt,
+        "You are a Roblox Builder. Return ONLY Lua code. Use Instance.new to build parts/models. Group them."
+    )
+
+def run_scripter(prompt, context=""):
+    set_agent("Scripter")
+    log_event("👨‍💻 Writing Logic...")
+    full_instruction = (
+        "You are a Roblox Scripter. Write valid Lua code. "
+        "Parent objects to workspace. "
+        f"CONTEXT INFO: {context}"
+    )
+    return call_swarm_intelligence(prompt, full_instruction)
+
+def run_tts_engineer(prompt):
+    set_agent("TTS Bot")
+    log_event("🗣️ Synthesizing Speech Logic...")
+    return call_swarm_intelligence(
+        prompt,
+        "You are a TTS Engineer. Write Roblox Lua code using 'TextChatService' to create dialogue bubbles "
+        "OR use 'Sound' objects if the user provided sound IDs. Create a function speak(text)."
+    )
+
+# --- 4. THE WEB SERVER ---
+
 @app.route('/')
 def home():
     return '''
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Dual-Core AI Commander</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+        <title>Swarm Command</title>
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;800&display=swap" rel="stylesheet">
         <style>
-            :root { --primary: #7000ff; --secondary: #00f2ea; --bg: #050505; }
-            body { font-family: 'Inter', sans-serif; background: var(--bg); color: white; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
-            .glow { position: absolute; width: 600px; height: 600px; background: radial-gradient(circle, var(--primary) 0%, transparent 60%); opacity: 0.2; filter: blur(50px); animation: move 10s infinite alternate; }
-            @keyframes move { from { transform: translate(-50px, -50px); } to { transform: translate(50px, 50px); } }
-            .card { background: rgba(255,255,255,0.05); padding: 40px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(20px); width: 400px; text-align: center; z-index: 2; box-shadow: 0 0 50px rgba(112, 0, 255, 0.2); }
-            input { width: 100%; padding: 15px; background: rgba(0,0,0,0.4); border: 1px solid #333; color: white; border-radius: 10px; margin: 20px 0; font-size: 16px; }
-            input:focus { border-color: var(--secondary); outline: none; box-shadow: 0 0 15px rgba(0, 242, 234, 0.3); }
-            button { width: 100%; padding: 15px; background: linear-gradient(45deg, var(--primary), #a200ff); border: none; border-radius: 10px; color: white; font-weight: bold; cursor: pointer; transition: 0.3s; }
-            button:hover { transform: scale(1.02); box-shadow: 0 0 20px var(--primary); }
-            #status { margin-top: 15px; font-size: 14px; color: #888; min-height: 20px; }
+            body { background: #050505; color: #00ff41; font-family: 'JetBrains Mono', monospace; padding: 50px; }
+            .container { max-width: 800px; margin: 0 auto; border: 1px solid #333; padding: 20px; box-shadow: 0 0 20px rgba(0, 255, 65, 0.1); }
+            h1 { text-transform: uppercase; border-bottom: 1px solid #333; padding-bottom: 10px; }
+            
+            .status-bar { display: flex; justify-content: space-between; margin-bottom: 20px; background: #111; padding: 10px; }
+            .badge { padding: 5px 10px; border-radius: 4px; font-weight: bold; }
+            .model-badge { background: #333; color: white; }
+            .agent-badge { background: #004400; color: #00ff41; }
+
+            #console { height: 300px; overflow-y: auto; background: #000; border: 1px solid #333; padding: 10px; margin-bottom: 20px; font-size: 14px; }
+            .log-entry { margin-bottom: 5px; opacity: 0.8; }
+            .log-entry:last-child { opacity: 1; font-weight: bold; color: #fff; }
+
+            input { width: 100%; padding: 15px; background: #111; border: 1px solid #333; color: white; font-family: inherit; margin-bottom: 10px; }
+            button { width: 100%; padding: 15px; background: #00ff41; color: black; font-weight: bold; border: none; cursor: pointer; }
+            button:hover { background: #00cc33; }
         </style>
     </head>
     <body>
-        <div class="glow"></div>
-        <div class="card">
-            <h1>AI Architect</h1>
-            <p style="color: #666; font-size: 14px;">Gemini (Logic) + Model_3D (Build)</p>
-            <input type="text" id="prompt" placeholder="E.g., Make a spinning neon tower..." onkeypress="if(event.key==='Enter') send()">
-            <button onclick="send()" id="btn">Generate</button>
-            <p id="status"></p>
+        <div class="container">
+            <h1>/// NEURAL SWARM ///</h1>
+            
+            <div class="status-bar">
+                <span id="activeModel" class="badge model-badge">WAITING</span>
+                <span id="activeAgent" class="badge agent-badge">IDLE</span>
+            </div>
+
+            <div id="console"></div>
+
+            <input type="text" id="prompt" placeholder="COMMAND: E.g., 'Search for sword sizes and build one that speaks'...">
+            <button onclick="sendCommand()">EXECUTE</button>
         </div>
+
         <script>
-            function send() {
+            function log(msg) {
+                let c = document.getElementById("console");
+                c.innerHTML += `<div class='log-entry'>> ${msg}</div>`;
+                c.scrollTop = c.scrollHeight;
+            }
+
+            function sendCommand() {
                 let p = document.getElementById("prompt").value;
-                let s = document.getElementById("status");
-                let b = document.getElementById("btn");
                 if(!p) return;
                 
-                b.disabled = true;
-                b.innerText = "Analyzing...";
-                s.innerText = "Routing Request...";
-                
                 fetch("/process", {
-                    method: "POST", 
+                    method: "POST",
                     headers: {"Content-Type": "application/json"},
                     body: JSON.stringify({prompt: p})
-                }).then(r=>r.json()).then(d=>{
-                    if(d.success) {
-                        s.innerText = "✓ Sent to Roblox!";
-                        s.style.color = "#00f2ea";
-                    } else {
-                        s.innerText = "Error: " + d.error;
-                        s.style.color = "red";
-                    }
-                    b.disabled = false;
-                    b.innerText = "Generate";
-                    document.getElementById("prompt").value = "";
                 });
+                document.getElementById("prompt").value = "";
             }
+
+            // Real-time Polling
+            setInterval(() => {
+                fetch("/status").then(r => r.json()).then(data => {
+                    document.getElementById("activeModel").innerText = data.active_model;
+                    document.getElementById("activeAgent").innerText = data.agent.toUpperCase();
+                    
+                    // Update logs if new ones exist
+                    let c = document.getElementById("console");
+                    // Clear and rebuild logs (simple way)
+                    c.innerHTML = "";
+                    data.logs.forEach(l => {
+                        c.innerHTML += `<div class='log-entry'>> ${l}</div>`;
+                    });
+                    c.scrollTop = c.scrollHeight;
+                });
+            }, 1000);
         </script>
     </body>
     </html>
     '''
 
-# --- BACKEND LOGIC ---
+@app.route('/status')
+def get_status():
+    return jsonify(current_status)
+
+# --- 5. THE BRAIN ---
+code_queue = []
+
 @app.route('/process', methods=['POST'])
-def process():
+def process_command():
     data = request.json
-    prompt = data.get('prompt', '')
+    prompt = data.get('prompt')
     
-    if not prompt: return jsonify({"success": False, "error": "Empty prompt"})
+    # Reset logs for new command
+    current_status["logs"] = []
+    log_event(f"📥 Received: {prompt}")
 
-    # 1. ASK THE ROUTER: What do we need?
-    plan = router(prompt)
-    
-    final_code = ""
-    
-    # 2. GENERATE MODEL (If needed)
-    if plan.get("needs_model"):
-        build_code = call_model_ai(prompt)
-        if build_code:
-            final_code += f"\n-- [AI GENERATED 3D MODEL]\n{build_code}\n"
+    def worker():
+        final_code = ""
+        context_data = ""
+
+        # 1. ROUTER
+        plan = run_router(prompt)
         
-    # 3. GENERATE SCRIPT (If needed)
-    if plan.get("needs_script"):
-        # We tell Gemini the model might already exist, so attach script to it
-        context_prompt = prompt
-        if plan.get("needs_model"):
-            context_prompt += " (The 3D model is already built by another AI. Write a script that finds this model in workspace and applies the logic to it.)"
-            
-        script_code = call_gemini(context_prompt, "You are a Roblox Scripter. Write ONLY Lua code.")
-        if script_code:
-            final_code += f"\n-- [AI GENERATED LOGIC]\n{script_code}\n"
+        # 2. SEARCH (If needed)
+        if plan.get("search_needed"):
+            search_result = run_searcher(prompt)
+            if search_result:
+                context_data += f"\n--[SEARCH DATA found on Web]:\n-- {search_result}\n"
+                log_event("✅ Search Data Acquired.")
 
-    # 4. CLEANUP
-    if final_code:
+        # 3. BUILDER (Architect)
+        if plan.get("build_needed"):
+            build_code = run_architect(prompt)
+            if build_code:
+                final_code += f"\n-- [ARCHITECT LAYER]\n{build_code}\n"
+                log_event("✅ 3D Model Drafted.")
+
+        # 4. TTS (If needed)
+        if plan.get("tts_needed"):
+            tts_code = run_tts_engineer(prompt)
+            if tts_code:
+                final_code += f"\n-- [TTS AUDIO LAYER]\n{tts_code}\n"
+                log_event("✅ Speech Logic Synthesized.")
+
+        # 5. SCRIPTER (The Closer)
+        # The scripter takes the search data + build info and makes it work
+        if plan.get("script_needed") or (not plan.get("build_needed")):
+            script_code = run_scripter(prompt, context=context_data)
+            if script_code:
+                final_code += f"\n-- [LOGIC LAYER]\n{script_code}\n"
+                log_event("✅ Core Logic Written.")
+
+        # FINISH
         final_code = final_code.replace("```lua", "").replace("```", "")
         code_queue.append(final_code)
-        return jsonify({"success": True})
-    
-    return jsonify({"success": False, "error": "AI produced no code"})
+        
+        set_agent("Done")
+        log_event("✨ All Tasks Complete. Ready for Roblox.")
+
+    # Run in background so UI updates immediately
+    threading.Thread(target=worker).start()
+    return jsonify({"success": True})
 
 @app.route('/get_latest_code', methods=['GET'])
 def get_code():
