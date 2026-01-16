@@ -1,98 +1,94 @@
 import os
 import requests
 import json
-import threading
-import time
 import base64
-from flask import Flask, request, jsonify, send_file
-from gtts import gTTS
-import io
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
 GEMINI_KEY = os.environ.get("GEMINI")
 
-# --- THE OMNI-ASSISTANT ROSTER ---
+# --- MODEL ROSTER ---
 MODELS = {
-    # The "Brain" that manages conversation flow
-    "DIRECTOR": "gemini-3-flash", 
-    # The "Ear" - Can understand uploaded audio files natively
-    "LISTENER": "gemini-2.5-flash", 
-    # The "Voice" - Optimized for conversation generation
-    "TALKER": "gemini-2.5-flash-native-audio-dialog",
-    # The "Worker" - General tasks
-    "WORKER": "gemini-2.5-flash",
-    # The "Fast" router
-    "SCOUT": "gemini-2.5-flash-lite"
+    "BRAIN": "gemini-3-flash",                    # Smartest Text Logic
+    "NATIVE_AUDIO": "gemini-2.5-flash-native-audio-dialog", # Speech-to-Speech
+    "NEURAL_TTS": "gemini-2.5-flash-tts",         # Text-to-Speech
+    "FALLBACK": "gemini-2.5-flash"                # Safety Net
 }
 
-# Global State
-current_status = {
-    "message": "System Online",
-    "logs": [],
-    "last_response": "",
-    "is_processing": False
-}
-
-def log_event(text, highlight=False):
-    prefix = "✨ " if highlight else ">> "
-    print(f"{prefix}{text}")
-    current_status["logs"].append(f"{prefix}{text}")
-    current_status["message"] = text
-
-# --- ROBUST AI CALLER ---
-def call_ai(primary_role, prompt, system_instruction, image_data=None, audio_data=None):
+# --- HELPER: GEMINI TEXT-TO-SPEECH ---
+def generate_neural_speech(text):
     """
-    Handles Text, Image, and Audio inputs with Fallbacks.
+    Uses Gemini-2.5-Flash-TTS to generate high-quality audio from text.
     """
-    primary_model = MODELS.get(primary_role, MODELS["WORKER"])
-    fallback_model = MODELS["WORKER"]
-
-    def _send(model_name, p, s, img=None, aud=None):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
-        
-        # Base content part
-        parts = [{"text": f"{s}\n\nUser Input: {p}"}]
-        
-        # If there is audio (Voice Chat), we append the audio blob
-        if aud:
-            parts.append({
-                "inline_data": {
-                    "mime_type": "audio/mp3", # Assumes MP3/WAV input
-                    "data": aud
-                }
-            })
-            
-        payload = { "contents": [{ "parts": parts }] }
-        return requests.post(url, json=payload)
-
-    # 1. Try Primary
-    try:
-        response = _send(primary_model, prompt, system_instruction, image_data, audio_data)
-        data = response.json()
-        if "candidates" in data:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        
-        err = data.get("error", {}).get("message", "Unknown Error")
-        log_event(f"⚠️ {primary_role} Busy: {err}")
-        log_event(f"🔄 Switching to Fallback...")
-
-    except Exception as e:
-        log_event(f"❌ Connection Fail: {e}")
-
-    # 2. Try Fallback
-    try:
-        response = _send(fallback_model, prompt, system_instruction, image_data, audio_data)
-        data = response.json()
-        if "candidates" in data:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-    except:
-        log_event("💀 CRITICAL: All agents failed.")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NEURAL_TTS']}:generateContent?key={GEMINI_KEY}"
+    payload = { "contents": [{ "parts": [{ "text": text }] }] }
     
-    return "I am having trouble connecting to the neural network."
+    try:
+        response = requests.post(url, json=payload)
+        data = response.json()
+        if "candidates" in data:
+            for part in data["candidates"][0]["content"]["parts"]:
+                if "inline_data" in part:
+                    return part["inline_data"]["data"] # Base64 Audio
+    except:
+        return None
+    return None
 
-# --- WEB SERVER ENDPOINTS ---
+# --- MAIN AI CALLER ---
+def call_ai(mode, prompt=None, audio_data=None):
+    """
+    Handles Text (Brain) and Voice (Native Audio) interactions.
+    """
+    
+    # 1. TEXT MODE (Silent, Smart, Gemini 3.0)
+    if mode == "text":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['BRAIN']}:generateContent?key={GEMINI_KEY}"
+        payload = { "contents": [{ "parts": [{ "text": f"You are a helpful assistant. User says: {prompt}" }] }] }
+        
+        try:
+            r = requests.post(url, json=payload)
+            return {"text": r.json()["candidates"][0]["content"]["parts"][0]["text"], "audio": None}
+        except:
+            return {"text": "Connection error with Gemini 3.0.", "audio": None}
+
+    # 2. VOICE MODE (Native Audio 2.5)
+    if mode == "voice":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NATIVE_AUDIO']}:generateContent?key={GEMINI_KEY}"
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    { "text": "Listen to this audio. Respond naturally with Audio." },
+                    { "inline_data": { "mime_type": "audio/mp3", "data": audio_data } }
+                ]
+            }]
+        }
+        
+        try:
+            r = requests.post(url, json=payload)
+            data = r.json()
+            
+            response_text = "Audio Message Received."
+            response_audio = None
+            
+            if "candidates" in data:
+                parts = data["candidates"][0]["content"]["parts"]
+                for part in parts:
+                    if "text" in part: response_text = part["text"]
+                    if "inline_data" in part: response_audio = part["inline_data"]["data"]
+
+            # FALLBACK: If Native Model gave text but NO audio, use Neural TTS
+            if not response_audio and response_text:
+                response_audio = generate_neural_speech(response_text)
+
+            return {"text": response_text, "audio": response_audio}
+
+        except Exception as e:
+            return {"text": f"Voice error: {str(e)}", "audio": None}
+
+# --- WEB SERVER ---
 
 @app.route('/')
 def home():
@@ -100,360 +96,200 @@ def home():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>Omni-Assistant</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-        <!-- FontAwesome for Icons -->
+        <title>Omni-Mobile</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+        <meta name="theme-color" content="#000000">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             :root {
-                --bg: #050508;
-                --card-bg: rgba(20, 20, 30, 0.7);
-                --glass-border: rgba(255, 255, 255, 0.08);
-                --primary: #00f2ea;
-                --primary-glow: rgba(0, 242, 234, 0.4);
-                --secondary: #7000ff;
+                --bg: #000000;
+                --surface: #121212;
+                --primary: #3b82f6;
+                --accent: #8b5cf6;
                 --text: #ffffff;
-                --text-dim: #8888aa;
-                --code-bg: #08080c;
+            }
+            * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+            body { 
+                background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif;
+                margin: 0; height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
             }
 
-            * { box-sizing: border-box; margin: 0; padding: 0; outline: none; }
-
-            body {
-                background: var(--bg);
-                color: var(--text);
-                font-family: 'Outfit', sans-serif;
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                overflow-x: hidden;
-                position: relative;
+            /* Header */
+            .header {
+                padding: 15px; text-align: center; background: linear-gradient(180deg, rgba(20,20,20,0.9), transparent);
+                z-index: 10; display: flex; justify-content: center; align-items: center; gap: 10px;
+            }
+            .badge { 
+                background: rgba(59, 130, 246, 0.2); color: var(--primary); 
+                padding: 4px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; text-transform: uppercase;
+                border: 1px solid rgba(59, 130, 246, 0.3);
             }
 
-            /* --- ANIMATED BACKGROUND --- */
-            .orb { position: absolute; border-radius: 50%; filter: blur(120px); opacity: 0.4; z-index: -1; animation: float 10s infinite alternate ease-in-out; }
-            .orb-1 { width: 600px; height: 600px; background: var(--secondary); top: -20%; left: -10%; }
-            .orb-2 { width: 500px; height: 500px; background: var(--primary); bottom: -10%; right: -10%; animation-delay: 2s; }
-            @keyframes float { 0% { transform: translate(0,0); } 100% { transform: translate(40px, 40px); } }
-
-            /* --- MAIN INTERFACE --- */
-            .interface {
-                width: 90%; max-width: 700px;
-                background: var(--card-bg);
-                backdrop-filter: blur(30px);
-                -webkit-backdrop-filter: blur(30px);
-                border: 1px solid var(--glass-border);
-                border-radius: 24px;
-                padding: 40px;
-                box-shadow: 0 20px 50px rgba(0,0,0,0.5);
-                transition: transform 0.3s;
-                position: relative;
-                z-index: 10;
+            /* Chat Area */
+            .chat-container {
+                flex-grow: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px;
+                scroll-behavior: smooth;
             }
-
-            h1 {
-                font-size: 28px; font-weight: 700; margin-bottom: 5px; letter-spacing: -0.5px;
-                background: linear-gradient(135deg, #fff 0%, #aaa 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-                display: flex; align-items: center; gap: 15px;
+            .message {
+                max-width: 85%; padding: 12px 16px; border-radius: 18px; font-size: 16px; line-height: 1.5;
+                animation: popIn 0.2s ease; word-wrap: break-word;
             }
-            .status-indicator { width: 10px; height: 10px; background: var(--primary); border-radius: 50%; box-shadow: 0 0 15px var(--primary); animation: pulse 2s infinite; }
-            @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.8); } 100% { opacity: 1; transform: scale(1); } }
+            .user-msg { 
+                align-self: flex-end; background: var(--primary); color: white; 
+                border-bottom-right-radius: 4px;
+            }
+            .ai-msg { 
+                align-self: flex-start; background: var(--surface); color: #e0e0e0; border: 1px solid #333;
+                border-bottom-left-radius: 4px;
+            }
+            @keyframes popIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+            /* Controls */
+            .controls {
+                padding: 15px; background: var(--surface); border-top: 1px solid #333;
+                display: flex; align-items: center; gap: 10px;
+                padding-bottom: max(20px, env(safe-area-inset-bottom));
+            }
             
-            p.subtitle { color: var(--text-dim); font-size: 14px; margin-bottom: 30px; font-weight: 300; display: flex; gap: 10px; align-items: center;}
-            .model-badge { font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; color: var(--primary); border: 1px solid rgba(0, 242, 234, 0.2); }
-
-            /* --- INPUT AREA --- */
-            .input-container { position: relative; margin-bottom: 20px; display: flex; gap: 10px; }
-            
-            input[type="text"] {
-                flex-grow: 1;
-                background: rgba(0,0,0,0.4);
-                border: 1px solid var(--glass-border);
-                padding: 18px;
-                border-radius: 16px;
-                color: #fff;
-                font-size: 16px;
-                font-family: 'Outfit', sans-serif;
-                transition: all 0.3s ease;
+            input {
+                flex-grow: 1; background: #222; border: none; color: white; padding: 14px 18px;
+                border-radius: 25px; font-size: 16px; /* Prevents Zoom */
             }
-            input:focus { border-color: var(--primary); box-shadow: 0 0 20px var(--primary-glow); }
+            input:focus { outline: 1px solid var(--primary); background: #333; }
 
-            /* --- MIC BUTTON --- */
+            /* Mic Button */
             #micBtn {
-                width: 60px; height: 60px;
-                border-radius: 50%;
-                border: 1px solid var(--glass-border);
-                background: rgba(255,255,255,0.05);
-                color: var(--text);
-                font-size: 20px;
-                cursor: pointer;
+                width: 50px; height: 50px; border-radius: 50%; border: none;
+                background: #222; color: #aaa; font-size: 20px;
                 display: flex; align-items: center; justify-content: center;
-                transition: 0.3s;
+                transition: 0.2s; touch-action: none;
             }
-            #micBtn:hover { background: rgba(255,255,255,0.1); border-color: var(--primary); color: var(--primary); }
-            #micBtn.recording { 
-                background: rgba(255, 0, 85, 0.2); 
-                border-color: #ff0055; 
-                color: #ff0055; 
-                animation: breathe 1.5s infinite; 
-            }
-            @keyframes breathe { 0% { box-shadow: 0 0 0 0 rgba(255, 0, 85, 0.4); } 70% { box-shadow: 0 0 0 15px rgba(255, 0, 85, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 0, 85, 0); } }
+            #micBtn.active { background: #ef4444; color: white; transform: scale(1.1); box-shadow: 0 0 15px rgba(239, 68, 68, 0.4); }
 
-            /* --- ACTION BUTTON --- */
+            /* Send Button */
             #sendBtn {
-                width: 100%; padding: 16px; border: none; border-radius: 16px;
-                background: linear-gradient(135deg, var(--primary) 0%, #00c2bb 100%);
-                color: #000; font-size: 16px; font-weight: 700; cursor: pointer;
-                transition: 0.3s; margin-bottom: 20px;
-                box-shadow: 0 10px 20px rgba(0, 242, 234, 0.15);
+                width: 50px; height: 50px; border-radius: 50%; border: none;
+                background: var(--primary); color: white; font-size: 18px;
             }
-            #sendBtn:hover { transform: translateY(-2px); box-shadow: 0 15px 30px rgba(0, 242, 234, 0.3); }
-
-            /* --- CONSOLE & RESPONSE --- */
-            .console-window {
-                background: var(--code-bg);
-                border-radius: 12px;
-                padding: 15px;
-                height: 150px;
-                overflow-y: auto;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 12px;
-                border: 1px solid var(--glass-border);
-                margin-bottom: 20px;
-            }
-            .console-window::-webkit-scrollbar { width: 5px; }
-            .console-window::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
-            .log-entry { margin-bottom: 6px; color: #aaa; display: flex; gap: 8px; }
-            
-            .response-area {
-                background: rgba(255,255,255,0.03);
-                border-radius: 12px;
-                padding: 20px;
-                min-height: 100px;
-                font-size: 15px;
-                line-height: 1.6;
-                color: #e0e0e0;
-                border: 1px solid var(--glass-border);
-                display: none;
-                animation: slideUp 0.5s ease;
-            }
-            @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+            #sendBtn:active { transform: scale(0.95); opacity: 0.8; }
 
         </style>
     </head>
     <body>
 
-        <div class="orb orb-1"></div>
-        <div class="orb orb-2"></div>
-
-        <div class="interface">
-            <h1><div class="status-indicator"></div> Omni-Assistant</h1>
-            <p class="subtitle">
-                Powered by Gemini Swarm
-                <span class="model-badge">2.5-Flash-TTS</span>
-                <span class="model-badge">Native-Audio</span>
-            </p>
-
-            <div class="input-container">
-                <input type="text" id="prompt" placeholder="Type a message or click Mic to speak..." autocomplete="off">
-                <button id="micBtn" onmousedown="startRecording()" onmouseup="stopRecording()" ontouchstart="startRecording()" ontouchend="stopRecording()">
-                    <i class="fa-solid fa-microphone"></i>
-                </button>
-            </div>
-
-            <button id="sendBtn" onclick="sendText()">Send Message</button>
-
-            <div class="console-window" id="console">
-                <div class="log-entry">>> System Online. Ready for Text or Voice input.</div>
-            </div>
-
-            <div class="response-area" id="responseBox"></div>
-            
-            <!-- Hidden Audio Player -->
-            <audio id="audioPlayer" style="display:none"></audio>
+        <div class="header">
+            <h3>Gemini</h3> <span class="badge">3.0 Brain</span> <span class="badge">Native Voice</span>
         </div>
 
+        <div class="chat-container" id="chat">
+            <div class="message ai-msg">Online. Text is silent. Voice speaks back.</div>
+        </div>
+
+        <div class="controls">
+            <button id="micBtn" ontouchstart="startRec()" ontouchend="stopRec()" onmousedown="startRec()" onmouseup="stopRec()">
+                <i class="fa-solid fa-microphone"></i>
+            </button>
+            <input type="text" id="prompt" placeholder="Message..." autocomplete="off">
+            <button id="sendBtn" onclick="sendText()"><i class="fa-solid fa-arrow-up"></i></button>
+        </div>
+
+        <audio id="audioPlayer" style="display:none"></audio>
+
         <script>
-            // --- LOGGING ---
-            function log(txt) { 
-                let c = document.getElementById("console");
-                c.innerHTML += `<div class="log-entry">${txt}</div>`;
-                c.scrollTop = c.scrollHeight;
+            function addMsg(text, type) {
+                let div = document.createElement("div");
+                div.className = "message " + type;
+                div.innerText = text;
+                document.getElementById("chat").appendChild(div);
+                document.getElementById("chat").scrollTop = document.getElementById("chat").scrollHeight;
             }
 
-            // --- TEXT CHAT ---
             function sendText() {
                 let p = document.getElementById("prompt");
-                let btn = document.getElementById("sendBtn");
-                if(!p.value) return;
+                let txt = p.value.trim();
+                if(!txt) return;
 
-                btn.innerText = "Thinking...";
-                document.getElementById("responseBox").style.display = "none";
-                
-                fetch("/process_text", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({prompt: p.value})
-                }).then(r => r.json()).then(handleResponse);
-                
+                addMsg(txt, "user-msg");
                 p.value = "";
+
+                // TEXT MODE: Silent (No Audio)
+                fetch("/process_text", {
+                    method: "POST", headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({prompt: txt})
+                }).then(r=>r.json()).then(d => {
+                    addMsg(d.text, "ai-msg");
+                });
             }
 
-            // --- VOICE CHAT LOGIC ---
-            let mediaRecorder;
-            let audioChunks = [];
+            // --- VOICE LOGIC ---
+            let recorder, chunks = [];
 
-            async function startRecording() {
-                document.getElementById("micBtn").classList.add("recording");
-                log("🎤 Listening...");
-                
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
-                audioChunks = [];
-
-                mediaRecorder.ondataavailable = event => {
-                    audioChunks.push(event.data);
-                };
-
-                mediaRecorder.start();
-            }
-
-            async function stopRecording() {
-                document.getElementById("micBtn").classList.remove("recording");
-                if (!mediaRecorder) return;
-                
-                mediaRecorder.stop();
-                mediaRecorder.onstop = async () => {
-                    log("⬆️ Uploading Audio to Gemini 2.5...");
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' }); // Webm is standard for browsers
-                    
-                    // Convert Blob to Base64 to send via JSON (easier for Flask)
-                    const reader = new FileReader();
-                    reader.readAsDataURL(audioBlob);
-                    reader.onloadend = () => {
-                        const base64Audio = reader.result.split(',')[1];
-                        
-                        fetch("/process_voice", {
-                            method: "POST",
-                            headers: {"Content-Type": "application/json"},
-                            body: JSON.stringify({audio: base64Audio})
-                        }).then(r => r.json()).then(handleResponse);
-                    };
-                };
-            }
-
-            // --- RESPONSE HANDLER ---
-            function handleResponse(data) {
-                let btn = document.getElementById("sendBtn");
-                btn.innerText = "Send Message";
-                
-                if(data.success) {
-                    // Show Text
-                    let box = document.getElementById("responseBox");
-                    box.innerText = data.text;
-                    box.style.display = "block";
-                    log("✅ Response Received.");
-
-                    // Play Audio (If available)
-                    if(data.audio_url) {
-                        log("🔊 Playing Neural Voice...");
-                        let player = document.getElementById("audioPlayer");
-                        player.src = data.audio_url + "?t=" + new Date().getTime(); // Prevent caching
-                        player.play();
-                    }
-                } else {
-                    log("❌ Error: " + data.error);
+            async function startRec() {
+                let btn = document.getElementById("micBtn");
+                btn.classList.add("active");
+                try {
+                    let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    recorder = new MediaRecorder(stream);
+                    chunks = [];
+                    recorder.ondataavailable = e => chunks.push(e.data);
+                    recorder.start();
+                } catch(e) { 
+                    btn.classList.remove("active");
+                    alert("Microphone access denied.");
                 }
             }
 
-            // --- STATUS LOOP ---
-            setInterval(() => {
-                fetch("/status").then(r=>r.json()).then(d => {
-                    if(d.logs.length > 0) {
-                        let c = document.getElementById("console");
-                        c.innerHTML = "";
-                        d.logs.forEach(l => { c.innerHTML += `<div class="log-entry">${l}</div>`; });
-                        c.scrollTop = c.scrollHeight;
-                    }
-                });
-            }, 1000);
+            function stopRec() {
+                document.getElementById("micBtn").classList.remove("active");
+                if(!recorder) return;
+                recorder.stop();
+                
+                addMsg("Listening...", "user-msg");
+
+                recorder.onstop = () => {
+                    let blob = new Blob(chunks, { type: 'audio/webm' });
+                    let reader = new FileReader();
+                    reader.readAsDataURL(blob);
+                    reader.onloadend = () => {
+                        let b64 = reader.result.split(',')[1];
+                        
+                        // VOICE MODE: Audio Response
+                        fetch("/process_voice", {
+                            method: "POST", headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({audio: b64})
+                        }).then(r=>r.json()).then(d => {
+                            addMsg(d.text, "ai-msg");
+                            
+                            if(d.audio) {
+                                let aud = document.getElementById("audioPlayer");
+                                aud.src = "data:audio/mp3;base64," + d.audio;
+                                aud.play();
+                            }
+                        });
+                    };
+                };
+            }
         </script>
     </body>
     </html>
     '''
 
-# --- BACKEND LOGIC ---
+# --- BACKEND ---
 
 @app.route('/process_text', methods=['POST'])
 def process_text():
-    data = request.json
-    prompt = data.get('prompt')
-    current_status["logs"] = []
-    
-    log_event(f"📝 Text Input: {prompt}")
-    
-    # 1. Ask the "Talker" model (optimized for dialog)
-    response_text = call_ai("TALKER", prompt, "You are a helpful, empathetic AI Assistant. Keep answers concise.")
-    
-    # 2. Generate Audio (Fallback TTS because specific Gemini Audio API is complex)
-    log_event("🔊 Generating Voice...")
-    try:
-        tts = gTTS(text=response_text, lang='en')
-        tts.save("static_response.mp3")
-        audio_ready = True
-    except:
-        audio_ready = False
-
-    return jsonify({
-        "success": True, 
-        "text": response_text, 
-        "audio_url": "/get_audio" if audio_ready else None
-    })
+    p = request.json.get('prompt')
+    # Use BRAIN (Gemini 3.0) for high IQ text answers
+    res = call_ai("text", prompt=p)
+    return jsonify({"text": res["text"]}) # Audio is null
 
 @app.route('/process_voice', methods=['POST'])
 def process_voice():
-    data = request.json
-    audio_b64 = data.get('audio')
-    current_status["logs"] = []
-    
-    log_event("🎧 Processing Voice Input...")
-    
-    # 1. Send Audio to "Listener" (Gemini 2.5 Flash handles audio natively)
-    response_text = call_ai(
-        "LISTENER", 
-        "Listen to this audio and respond helpfully.", 
-        "You are a Voice Assistant.", 
-        audio_data=audio_b64
-    )
-    
-    # 2. Generate Audio Output
-    log_event("🔊 Synthesizing Reply...")
-    try:
-        tts = gTTS(text=response_text, lang='en')
-        tts.save("static_response.mp3")
-        audio_ready = True
-    except:
-        audio_ready = False
-
-    return jsonify({
-        "success": True, 
-        "text": response_text, 
-        "audio_url": "/get_audio" if audio_ready else None
-    })
-
-@app.route('/get_audio')
-def get_audio():
-    try:
-        return send_file("static_response.mp3", mimetype="audio/mp3")
-    except:
-        return "No audio", 404
-
-@app.route('/status')
-def status():
-    return jsonify(current_status)
+    b64 = request.json.get('audio')
+    # Use NATIVE AUDIO 2.5 for speech-to-speech
+    res = call_ai("voice", audio_data=b64)
+    return jsonify({"text": res["text"], "audio": res["audio"]})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
