@@ -2,12 +2,30 @@ import os
 import requests
 import json
 import base64
-from flask import Flask, request, jsonify
+import markdown2
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
 GEMINI_KEY = os.environ.get("GEMINI")
+
+# --- MARKDOWN PARSING ---
+def parse_markdown(text):
+    """Convert markdown text to HTML with support for tables, code highlighting, and math"""
+    extras = [
+        "tables",
+        "code-friendly", 
+        "fenced-code-blocks",
+        "strike",
+        "footnotes",
+        "header-ids",
+        "toc",
+        "spoiler",
+        "smarty-pants",
+        "link-patterns"
+    ]
+    return markdown2.markdown(text, extras=extras)
 
 # --- MODEL ROSTER ---
 MODELS = {
@@ -232,6 +250,146 @@ def home():
                 display: flex; align-items: center; justify-content: center; cursor: pointer;
             }
 
+            /* --- MARKDOWN STYLES --- */
+            .ai-msg h1, .ai-msg h2, .ai-msg h3, .ai-msg h4, .ai-msg h5, .ai-msg h6 {
+                margin: 15px 0 10px 0; font-weight: 700; line-height: 1.3;
+            }
+            .ai-msg h1 { font-size: 1.8em; color: var(--primary); border-bottom: 2px solid var(--primary); padding-bottom: 5px; }
+            .ai-msg h2 { font-size: 1.5em; color: var(--secondary); border-bottom: 1px solid var(--secondary); padding-bottom: 3px; }
+            .ai-msg h3 { font-size: 1.3em; color: #fff; }
+            .ai-msg h4 { font-size: 1.1em; color: #ddd; }
+            .ai-msg h5 { font-size: 1em; color: #ccc; }
+            .ai-msg h6 { font-size: 0.9em; color: #bbb; }
+
+            .ai-msg p { margin: 10px 0; line-height: 1.6; }
+
+            .ai-msg em, .ai-msg i { font-style: italic; color: #ddd; }
+            .ai-msg strong, .ai-msg b { font-weight: 700; color: #fff; }
+            .ai-msg strong em, .ai-msg b i { font-weight: 700; font-style: italic; color: #fff; }
+            .ai-msg del, .ai-msg strike { text-decoration: line-through; color: #888; }
+
+            .ai-msg ul, .ai-msg ol { margin: 10px 0; padding-left: 25px; }
+            .ai-msg li { margin: 5px 0; line-height: 1.5; }
+            .ai-msg ul li { list-style-type: disc; }
+            .ai-msg ol li { list-style-type: decimal; }
+            .ai-msg ul li input[type="checkbox"] { margin-right: 8px; }
+
+            .ai-msg code {
+                background: rgba(0, 242, 234, 0.1); color: var(--primary);
+                padding: 2px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace;
+                font-size: 0.9em; border: 1px solid rgba(0, 242, 234, 0.3);
+            }
+
+            .ai-msg pre {
+                background: rgba(0, 0, 0, 0.6); border: 1px solid var(--glass-border);
+                border-radius: 8px; padding: 15px; margin: 15px 0; overflow-x: auto;
+                position: relative;
+            }
+            .ai-msg pre code {
+                background: none; padding: 0; border: none; color: #fff; font-size: 0.9em;
+                line-height: 1.5;
+            }
+
+            .ai-msg blockquote {
+                border-left: 4px solid var(--primary); margin: 15px 0; padding: 10px 20px;
+                background: rgba(0, 242, 234, 0.05); border-radius: 0 8px 8px 0;
+                font-style: italic; color: #ddd;
+            }
+            .ai-msg blockquote blockquote {
+                border-left: 4px solid var(--secondary); margin: 10px 0; padding: 8px 15px;
+                background: rgba(112, 0, 255, 0.05);
+            }
+
+            .ai-msg table {
+                border-collapse: collapse; width: 100%; margin: 15px 0; background: rgba(0, 0, 0, 0.3);
+                border-radius: 8px; overflow: hidden;
+            }
+            .ai-msg th, .ai-msg td {
+                border: 1px solid var(--glass-border); padding: 10px 15px; text-align: left;
+            }
+            .ai-msg th {
+                background: rgba(0, 242, 234, 0.1); font-weight: 700; color: var(--primary);
+            }
+            .ai-msg tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
+            .ai-msg tr:hover { background: rgba(0, 242, 234, 0.05); }
+
+            .ai-msg hr {
+                border: none; height: 2px; background: linear-gradient(90deg, transparent, var(--primary), transparent);
+                margin: 20px 0; opacity: 0.5;
+            }
+
+            .ai-msg a {
+                color: var(--primary); text-decoration: none; border-bottom: 1px solid transparent;
+                transition: all 0.3s;
+            }
+            .ai-msg a:hover { color: var(--secondary); border-bottom-color: var(--secondary); }
+
+            .ai-msg img {
+                max-width: 100%; height: auto; border-radius: 8px; margin: 10px 0;
+                border: 1px solid var(--glass-border);
+            }
+
+            .ai-msg .math-inline, .ai-msg .math-block {
+                font-family: 'JetBrains Mono', monospace; background: rgba(112, 0, 255, 0.1);
+                padding: 2px 6px; border-radius: 4px; color: var(--secondary);
+            }
+            .ai-msg .math-block {
+                display: block; padding: 15px; margin: 15px 0; text-align: center;
+                background: rgba(112, 0, 255, 0.05); border: 1px solid rgba(112, 0, 255, 0.3);
+                border-radius: 8px; font-size: 1.1em;
+            }
+
+            .ai-msg sub, .ai-msg sup { font-size: 0.8em; line-height: 0; position: relative; }
+            .ai-msg sub { bottom: -0.3em; }
+            .ai-msg sup { top: -0.3em; }
+            .ai-msg u { text-decoration: underline; color: #ddd; }
+
+            .ai-msg .footnote-ref {
+                font-size: 0.8em; vertical-align: super; color: var(--primary);
+                cursor: pointer;
+            }
+            .ai-msg .footnotes {
+                margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--glass-border);
+                font-size: 0.9em; color: #888;
+            }
+
+            /* --- THINKING INDICATOR --- */
+            .thinking-msg {
+                align-self: flex-start; background: var(--ai-bubble); color: #eee;
+                border: 1px solid var(--glass-border); border-bottom-left-radius: 4px;
+                max-width: 85%; padding: 12px 16px; border-radius: 18px; font-size: 15px;
+                position: relative; word-wrap: break-word; animation: popIn 0.2s ease;
+            }
+            .thinking-content {
+                display: flex; align-items: center; gap: 8px;
+            }
+            .thinking-dots {
+                display: flex; gap: 4px; align-items: center;
+            }
+            .thinking-dot {
+                width: 8px; height: 8px; background: var(--primary); border-radius: 50%;
+                animation: thinkingPulse 1.4s infinite ease-in-out both;
+            }
+            .thinking-dot:nth-child(1) { animation-delay: -0.32s; }
+            .thinking-dot:nth-child(2) { animation-delay: -0.16s; }
+            .thinking-dot:nth-child(3) { animation-delay: 0s; }
+            @keyframes thinkingPulse {
+                0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+                40% { transform: scale(1.2); opacity: 1; }
+            }
+            .thinking-text {
+                color: #aaa; font-size: 14px; font-style: italic;
+            }
+            .thinking-pulse {
+                display: inline-block; width: 6px; height: 6px; background: var(--primary);
+                border-radius: 50%; margin-left: 8px; animation: pulse 1.5s infinite;
+            }
+            @keyframes pulse {
+                0% { transform: scale(1); opacity: 1; }
+                50% { transform: scale(1.5); opacity: 0.7; }
+                100% { transform: scale(1); opacity: 1; }
+            }
+
         </style>
     </head>
     <body>
@@ -301,7 +459,7 @@ def home():
                 document.getElementById('dtCheck').style.display = deepThinkEnabled ? 'block' : 'none';
             }
 
-            function addMsg(text, type, img=null) {
+            function addMsg(text, type, img=null, isHtml=false) {
                 let div = document.createElement("div");
                 div.className = "message " + type;
                 if (img) {
@@ -311,11 +469,64 @@ def home():
                     div.appendChild(i);
                 }
                 let t = document.createElement("div");
-                t.innerText = text;
+                if (isHtml && type === "ai-msg") {
+                    t.innerHTML = text;
+                } else {
+                    t.innerText = text;
+                }
                 div.appendChild(t);
                 let container = document.getElementById("chat");
                 container.appendChild(div);
                 container.scrollTop = container.scrollHeight;
+            }
+
+            function addThinkingMsg(text = "Thinking") {
+                let div = document.createElement("div");
+                div.className = "thinking-msg";
+                div.id = "thinkingMsg";
+                
+                let content = document.createElement("div");
+                content.className = "thinking-content";
+                
+                let textSpan = document.createElement("span");
+                textSpan.className = "thinking-text";
+                textSpan.textContent = text;
+                
+                let dots = document.createElement("div");
+                dots.className = "thinking-dots";
+                
+                for (let i = 0; i < 3; i++) {
+                    let dot = document.createElement("div");
+                    dot.className = "thinking-dot";
+                    dots.appendChild(dot);
+                }
+                
+                content.appendChild(textSpan);
+                content.appendChild(dots);
+                div.appendChild(content);
+                
+                let container = document.getElementById("chat");
+                container.appendChild(div);
+                container.scrollTop = container.scrollHeight;
+                
+                return div;
+            }
+
+            function removeThinkingMsg() {
+                let thinkingMsg = document.getElementById("thinkingMsg");
+                if (thinkingMsg) {
+                    thinkingMsg.remove();
+                }
+            }
+
+            function updateThinkingText(text) {
+                let thinkingMsg = document.getElementById("thinkingMsg");
+                if (thinkingMsg) {
+                    let textSpan = thinkingMsg.querySelector(".thinking-text");
+                    if (textSpan) {
+                        textSpan.textContent = text;
+                    }
+                }
             }
 
             // Image Logic
@@ -358,13 +569,61 @@ def home():
                 let payload = { prompt: txt, model: currentModel, deep_think: deepThinkEnabled };
                 if (currentImageBase64) { payload.image = currentImageBase64; clearImage(); }
 
-                if (deepThinkEnabled) addMsg("Director is reviewing...", "ai-msg");
+                // Show thinking indicator
+                let thinkingMsg = addThinkingMsg("Thinking...");
 
-                fetch("/process_text", {
-                    method: "POST", headers: {"Content-Type": "application/json"},
+                // Use fetch with streaming
+                fetch('/process_text_stream', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(payload)
-                }).then(r=>r.json()).then(d => {
-                    addMsg(d.text, "ai-msg");
+                }).then(response => {
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    
+                    function readStream() {
+                        return reader.read().then(({ done, value }) => {
+                            if (done) {
+                                removeThinkingMsg();
+                                return;
+                            }
+                            
+                            const chunk = decoder.decode(value, { stream: true });
+                            const lines = chunk.split('\n');
+                            
+                            for (const line of lines) {
+                                if (line.startsWith('data: ')) {
+                                    try {
+                                        const data = JSON.parse(line.slice(6));
+                                        if (data.type === 'thinking') {
+                                            updateThinkingText(data.text);
+                                        } else if (data.type === 'response') {
+                                            removeThinkingMsg();
+                                            addMsg(data.html || data.text, "ai-msg", null, !!data.html);
+                                        } else if (data.type === 'done') {
+                                            return;
+                                        }
+                                    } catch (e) {
+                                        console.error('Error parsing data:', e);
+                                    }
+                                }
+                            }
+                            
+                            return readStream();
+                        });
+                    }
+                    
+                    return readStream();
+                }).catch(error => {
+                    removeThinkingMsg();
+                    console.error('Streaming error:', error);
+                    // Fallback to regular endpoint
+                    fetch("/process_text", {
+                        method: "POST", headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify(payload)
+                    }).then(r=>r.json()).then(d => {
+                        addMsg(d.html || d.text, "ai-msg", null, !!d.html);
+                    });
                 });
             }
 
@@ -417,7 +676,38 @@ def home():
 def process_text():
     data = request.json
     res = call_ai("text", model_id=data.get('model'), prompt=data.get('prompt'), image_data=data.get('image'), deep_think=data.get('deep_think'))
-    return jsonify({"text": res["text"]})
+    html_content = parse_markdown(res["text"])
+    return jsonify({"text": res["text"], "html": html_content})
+
+@app.route('/process_text_stream', methods=['POST'])
+def process_text_stream():
+    data = request.json
+    
+    def generate():
+        # Send thinking status updates
+        yield f"data: {json.dumps({'type': 'thinking', 'text': 'Analyzing your request...'})}\n\n"
+        
+        # Simulate processing steps
+        import time
+        time.sleep(0.5)
+        yield f"data: {json.dumps({'type': 'thinking', 'text': 'Processing with AI model...'})}\n\n"
+        
+        if data.get('deep_think'):
+            time.sleep(0.5)
+            yield f"data: {json.dumps({'type': 'thinking', 'text': 'Director is reviewing...'})}\n\n"
+            time.sleep(0.5)
+            yield f"data: {json.dumps({'type': 'thinking', 'text': 'Refining response...'})}\n\n"
+        
+        # Get actual AI response
+        res = call_ai("text", model_id=data.get('model'), prompt=data.get('prompt'), 
+                     image_data=data.get('image'), deep_think=data.get('deep_think'))
+        
+        # Send final response
+        html_content = parse_markdown(res["text"])
+        yield f"data: {json.dumps({'type': 'response', 'text': res['text'], 'html': html_content})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+    
+    return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/process_voice', methods=['POST'])
 def process_voice():
