@@ -10,38 +10,69 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 GEMINI_KEY = os.environ.get("GEMINI")
 
-# --- MODEL ROSTER (Kept exactly as requested) ---
-MODELS = {
-    "GEMINI": "gemini-3-flash-preview",                   # Standard Brain
-    "GEMMA": "gemma-3-27b-it",                            # Creative / Open Model
-    "DIRECTOR": "gemini-3-flash-preview",                 # Deep Think Reviewer
-    "NATIVE_AUDIO": "gemini-2.5-flash-native-audio-dialog", # Voice Mode
-    "NEURAL_TTS": "gemini-2.5-flash-tts"                  # Fallback TTS
+# --- MODEL CHAINS (Your Exact Selection + Your Requested Fallbacks) ---
+MODEL_CHAINS = {
+    "GEMINI": [
+        "gemini-3-flash-preview",  # Your requested main model
+        "gemini-2.5-flash",        # Your requested fallback
+        "gemini-2.5-flash-lite"    # Your requested fallback
+    ],
+    "GEMMA": [
+        "gemma-3-27b-it",          # Your requested main model
+        "gemma-3-12b-it",          # Fallbacks you requested...
+        "gemma-3-4b-it",
+        "gemma-3-2b-it",
+        "gemma-3-1b-it"
+    ],
+    "DIRECTOR": [
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash"
+    ],
+    "NATIVE_AUDIO": ["gemini-2.5-flash-native-audio-dialog"],
+    "NEURAL_TTS": ["gemini-2.5-flash-tts"]
 }
 
 # --- MARKDOWN PARSING ---
 def parse_markdown(text):
-    """Convert markdown text to HTML with support for tables, code highlighting, and math"""
-    extras = [
-        "tables",
-        "code-friendly", 
-        "fenced-code-blocks",
-        "strike",
-        "footnotes",
-        "header-ids",
-        "toc",
-        "spoiler",
-        "smarty-pants",
-        "link-patterns"
-    ]
+    """Convert markdown text to HTML"""
+    extras = ["tables", "code-friendly", "fenced-code-blocks", "strike", "footnotes", "header-ids", "toc", "spoiler", "smarty-pants", "link-patterns"]
     try:
         return markdown2.markdown(text, extras=extras)
     except:
-        return text # Fallback to raw text if parsing fails
+        return text
+
+# --- HELPER: ROBUST REQUEST ---
+def try_model_chain(chain_key, payload):
+    """Iterates through your list of models until one succeeds"""
+    models = MODEL_CHAINS.get(chain_key, MODEL_CHAINS["GEMINI"])
+    last_error = "No models available"
+
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        try:
+            r = requests.post(url, json=payload)
+            
+            if r.status_code != 200:
+                print(f"⚠️ {model} Failed ({r.status_code}). Switching to next...")
+                continue
+            
+            data = r.json()
+            if "error" in data:
+                print(f"⚠️ {model} API Error. Switching...")
+                continue
+                
+            if "candidates" in data and len(data["candidates"]) > 0:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+                
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"Error: All models in chain {chain_key} failed."
 
 # --- HELPER: TTS ---
 def generate_neural_speech(text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NEURAL_TTS']}:generateContent?key={GEMINI_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_CHAINS['NEURAL_TTS'][0]}:generateContent?key={GEMINI_KEY}"
     payload = { "contents": [{ "parts": [{ "text": text }] }] }
     try:
         r = requests.post(url, json=payload)
@@ -54,29 +85,21 @@ def generate_neural_speech(text):
 
 # --- DEEP THINK LOGIC ---
 def director_review(prompt, initial_response):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['DIRECTOR']}:generateContent?key={GEMINI_KEY}"
-    
     review_prompt = (
         f"User Prompt: {prompt}\n"
         f"AI Draft Response: {initial_response}\n\n"
         "You are the Director. Review the draft for accuracy, tone, and safety. "
         "If it's good, return it exactly as is. If it needs improvement, rewrite it better."
     )
-    
     payload = { "contents": [{ "parts": [{ "text": review_prompt }] }] }
-    try:
-        r = requests.post(url, json=payload)
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except:
-        return initial_response # Fallback to original if review fails
+    return try_model_chain("DIRECTOR", payload)
 
 # --- MAIN AI CALLER ---
 def call_ai(mode, model_id=None, prompt=None, audio_data=None, image_data=None, deep_think=False):
     
-    # 1. TEXT/IMAGE MODE (Silent)
+    # 1. TEXT/IMAGE MODE
     if mode == "text":
-        target_model = MODELS.get(model_id, MODELS["GEMINI"])
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={GEMINI_KEY}"
+        chain_key = model_id if model_id in MODEL_CHAINS else "GEMINI"
         
         parts = [{ "text": f"User: {prompt}" }]
         
@@ -90,29 +113,17 @@ def call_ai(mode, model_id=None, prompt=None, audio_data=None, image_data=None, 
 
         payload = { "contents": [{ "parts": parts }] }
         
-        try:
-            r = requests.post(url, json=payload)
-            # Check for API errors
-            if r.status_code != 200:
-                return {"text": f"API Error {r.status_code}: {r.text}", "audio": None}
-                
-            response_json = r.json()
-            if "candidates" not in response_json:
-                return {"text": "Model returned no content.", "audio": None}
-
-            response_text = response_json["candidates"][0]["content"]["parts"][0]["text"]
+        response_text = try_model_chain(chain_key, payload)
+        
+        if deep_think:
+            response_text = director_review(prompt, response_text)
             
-            # Apply Deep Think if requested
-            if deep_think:
-                response_text = director_review(prompt, response_text)
-                
-            return {"text": response_text, "audio": None}
-        except Exception as e: 
-            return {"text": f"System Error: {str(e)}", "audio": None}
+        return {"text": response_text, "audio": None}
 
-    # 2. VOICE MODE (Audible)
+    # 2. VOICE MODE
     if mode == "voice":
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NATIVE_AUDIO']}:generateContent?key={GEMINI_KEY}"
+        # Native Audio doesn't support chaining easily due to different return types, mostly single model
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_CHAINS['NATIVE_AUDIO'][0]}:generateContent?key={GEMINI_KEY}"
         payload = {
             "contents": [{
                 "parts": [
@@ -133,7 +144,9 @@ def call_ai(mode, model_id=None, prompt=None, audio_data=None, image_data=None, 
                     if "text" in part: resp_text = part["text"]
                     if "inline_data" in part: resp_audio = part["inline_data"]["data"]
 
-            if not resp_audio: resp_audio = generate_neural_speech(resp_text)
+            if not resp_audio: 
+                resp_audio = generate_neural_speech(resp_text)
+                
             return {"text": resp_text, "audio": resp_audio}
         except Exception as e: return {"text": str(e), "audio": None}
 
@@ -307,7 +320,7 @@ def home():
         </div>
 
         <div class="chat-container" id="chat">
-            <div class="message ai-msg">Online. Shift+Enter for new line.</div>
+            <div class="message ai-msg">Online.</div>
         </div>
 
         <div class="input-area">
@@ -442,7 +455,6 @@ def home():
                     body: JSON.stringify(payload)
                 }).then(r=>r.json()).then(d => {
                     removeThinkingMsg();
-                    // Use d.html for markdown rendering, fallback to d.text
                     addMsg(d.html || d.text, "ai-msg", null, true);
                 });
             }
