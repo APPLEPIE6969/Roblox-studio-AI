@@ -1,112 +1,136 @@
 import os
-import requests
 import json
 import base64
+import asyncio
+import requests
+import markdown2
+import numpy as np
 from flask import Flask, request, jsonify
+from flask_sock import Sock
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
+sock = Sock(app)
 
 # --- CONFIGURATION ---
 GEMINI_KEY = os.environ.get("GEMINI")
 
-# --- MODEL ROSTER ---
-MODELS = {
-    "GEMINI": "gemini-3-flash",                   # Standard Brain
-    "GEMMA": "gemma-3-27b-it",                    # Creative / Open Model
-    "DIRECTOR": "gemini-3-flash",                 # Deep Think Reviewer
-    "NATIVE_AUDIO": "gemini-2.5-flash-native-audio-dialog", # Voice Mode
-    "NEURAL_TTS": "gemini-2.5-flash-tts"          # Fallback TTS
+# --- MODEL CHAINS (Restored) ---
+MODEL_CHAINS = {
+    "GEMINI": [
+        "gemini-3-flash-preview", 
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite"
+    ],
+    "GEMMA": [
+        "gemma-3-27b-it",
+        "gemma-3-12b-it",
+        "gemma-3-4b-it",
+        "gemma-3-2b-it"
+    ],
+    "DIRECTOR": [
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite"
+    ],
+    # Voice models
+    "NATIVE_AUDIO": "gemini-2.5-flash-native-audio-dialog", 
+    "NEURAL_TTS": "gemini-2.5-flash-tts"
 }
 
-# --- HELPER: TTS ---
-def generate_neural_speech(text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NEURAL_TTS']}:generateContent?key={GEMINI_KEY}"
-    payload = { "contents": [{ "parts": [{ "text": text }] }] }
+# --- MARKDOWN PARSING ---
+def parse_markdown(text):
     try:
-        r = requests.post(url, json=payload)
-        data = r.json()
-        if "candidates" in data:
-            for part in data["candidates"][0]["content"]["parts"]:
-                if "inline_data" in part: return part["inline_data"]["data"]
-    except: return None
-    return None
+        return markdown2.markdown(text, extras=["tables", "fenced-code-blocks", "strike", "break-on-newline"])
+    except: return text
 
-# --- DEEP THINK LOGIC ---
-def director_review(prompt, initial_response):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['DIRECTOR']}:generateContent?key={GEMINI_KEY}"
+# --- HELPER: ROBUST REQUEST (Restored) ---
+def try_model_chain(chain_key, payload):
+    """Iterates through the fallback chain until one works"""
+    models = MODEL_CHAINS.get(chain_key, MODEL_CHAINS["GEMINI"])
+    last_error = "No models available"
+
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        try:
+            r = requests.post(url, json=payload)
+            if r.status_code != 200:
+                print(f"⚠️ {model} Failed ({r.status_code}). Switching...")
+                continue
+            
+            data = r.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            
+            if "error" in data:
+                print(f"⚠️ {model} API Error. Switching...")
+                continue
+                
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"Error: All models failed. ({last_error})"
+
+# --- REST AI CALLER ---
+def call_ai_text(model_id, prompt, image_data=None, deep_think=False):
+    chain_key = model_id if model_id in MODEL_CHAINS else "GEMINI"
     
-    review_prompt = (
-        f"User Prompt: {prompt}\n"
-        f"AI Draft Response: {initial_response}\n\n"
-        "You are the Director. Review the draft for accuracy, tone, and safety. "
-        "If it's good, return it exactly as is. If it needs improvement, rewrite it better."
+    # 1. Director Review (Deep Think)
+    if deep_think:
+        prompt = f"CRITICAL INSTRUCTION: Review your own answer for accuracy/tone before replying.\n\nUser: {prompt}"
+
+    parts = [{ "text": prompt }]
+    if image_data:
+        parts.append({ "inline_data": { "mime_type": "image/jpeg", "data": image_data } })
+    
+    payload = { "contents": [{ "parts": parts }] }
+    
+    return try_model_chain(chain_key, payload)
+
+# --- WEBSOCKET LIVE CALL (Fixed Audio) ---
+@sock.route('/ws/live')
+def live_socket(ws):
+    client = genai.Client(api_key=GEMINI_KEY, http_options={'api_version': 'v1alpha'})
+    
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"], 
     )
     
-    payload = { "contents": [{ "parts": [{ "text": review_prompt }] }] }
+    async def session_loop():
+        async with client.aio.live.connect(model=MODEL_CHAINS["NATIVE_AUDIO"], config=config) as session:
+            
+            async def send_audio():
+                while True:
+                    try:
+                        data = ws.receive()
+                        if not data: break
+                        msg = json.loads(data)
+                        
+                        if "audio" in msg:
+                            # Send raw PCM to Gemini
+                            await session.send(input={"data": msg["audio"], "mime_type": "application/pcm"}, end_of_turn=False)
+                        elif "commit" in msg:
+                            await session.send(input={}, end_of_turn=True)
+                    except: break
+
+            async def receive_response():
+                async for response in session.receive():
+                    if response.server_content and response.server_content.model_turn:
+                        for part in response.server_content.model_turn.parts:
+                            if part.inline_data:
+                                # Send Audio back to browser
+                                b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                                ws.send(json.dumps({"audio": b64}))
+
+            await asyncio.gather(send_audio(), receive_response())
+
     try:
-        r = requests.post(url, json=payload)
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except:
-        return initial_response # Fallback to original if review fails
-
-# --- MAIN AI CALLER ---
-def call_ai(mode, model_id=None, prompt=None, audio_data=None, image_data=None, deep_think=False):
-    
-    # 1. TEXT/IMAGE MODE (Silent)
-    if mode == "text":
-        target_model = MODELS.get(model_id, MODELS["GEMINI"])
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={GEMINI_KEY}"
-        
-        parts = [{ "text": f"User: {prompt}" }]
-        
-        if image_data:
-            parts.append({
-                "inline_data": {
-                    "mime_type": "image/jpeg", 
-                    "data": image_data
-                }
-            })
-
-        payload = { "contents": [{ "parts": parts }] }
-        
-        try:
-            r = requests.post(url, json=payload)
-            response_text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            
-            # Apply Deep Think if requested
-            if deep_think:
-                response_text = director_review(prompt, response_text)
-                
-            return {"text": response_text, "audio": None}
-        except Exception as e: 
-            return {"text": f"Error: {str(e)}", "audio": None}
-
-    # 2. VOICE MODE (Audible)
-    if mode == "voice":
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELS['NATIVE_AUDIO']}:generateContent?key={GEMINI_KEY}"
-        payload = {
-            "contents": [{
-                "parts": [
-                    { "text": "Listen and respond naturally." },
-                    { "inline_data": { "mime_type": "audio/mp3", "data": audio_data } }
-                ]
-            }]
-        }
-        try:
-            r = requests.post(url, json=payload)
-            data = r.json()
-            resp_text = "Audio Message."
-            resp_audio = None
-            
-            if "candidates" in data:
-                parts = data["candidates"][0]["content"]["parts"]
-                for part in parts:
-                    if "text" in part: resp_text = part["text"]
-                    if "inline_data" in part: resp_audio = part["inline_data"]["data"]
-
-            if not resp_audio: resp_audio = generate_neural_speech(resp_text)
-            return {"text": resp_text, "audio": resp_audio}
-        except Exception as e: return {"text": str(e), "audio": None}
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(session_loop())
+    except: pass
 
 # --- WEB SERVER ---
 
@@ -116,313 +140,303 @@ def home():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>Omni-Chat Ultimate</title>
+        <title>Omni-Chat Live</title>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
         <meta name="theme-color" content="#050508">
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
-            :root {
-                --bg: #050508;
-                --header-bg: rgba(20, 20, 30, 0.95);
-                --glass-border: rgba(255, 255, 255, 0.08);
-                --primary: #00f2ea;
-                --secondary: #7000ff;
-                --gemma: #ff0055;
-                --director: #ffd700;
-                --text: #ffffff;
-                --user-bubble: linear-gradient(135deg, var(--primary) 0%, #00a8a2 100%);
-                --ai-bubble: rgba(255, 255, 255, 0.05);
-            }
+            :root { --bg: #050508; --header: rgba(20,20,30,0.95); --border: rgba(255,255,255,0.1); --primary: #00f2ea; --secondary: #7000ff; --text: #fff; }
+            * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+            body { background: var(--bg); color: var(--text); font-family: 'Outfit', sans-serif; height: 100dvh; display: flex; flex-direction: column; margin: 0; overflow: hidden; }
 
-            * { box-sizing: border-box; margin: 0; padding: 0; outline: none; -webkit-tap-highlight-color: transparent; }
-
-            body {
-                background: var(--bg); color: var(--text); font-family: 'Outfit', sans-serif;
-                height: 100dvh; display: flex; flex-direction: column; overflow: hidden; position: relative;
-            }
-
-            /* --- ANIMATED BACKGROUND --- */
             .orb { position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.3; z-index: -1; animation: float 10s infinite alternate; }
             .orb-1 { width: 400px; height: 400px; background: var(--secondary); top: -10%; left: -10%; }
             .orb-2 { width: 300px; height: 300px; background: var(--primary); bottom: -10%; right: -10%; animation-delay: 2s; }
             @keyframes float { 0% { transform: translate(0,0); } 100% { transform: translate(30px, 30px); } }
 
-            /* --- HEADER --- */
-            .header {
-                padding: 10px 15px; background: var(--header-bg); backdrop-filter: blur(20px);
-                border-bottom: 1px solid var(--glass-border); z-index: 10;
-                display: flex; flex-direction: column; gap: 10px;
-            }
-            .top-row { display: flex; align-items: center; justify-content: space-between; width: 100%; }
-            
-            .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+            .header { padding: 10px 15px; background: var(--header); border-bottom: 1px solid var(--border); z-index: 10; display: flex; flex-direction: column; gap: 10px; }
+            .top { display: flex; justify-content: space-between; align-items: center; }
+            .brand { font-weight: 700; font-size: 18px; display: flex; gap: 10px; align-items: center; }
             .dot { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; box-shadow: 0 0 10px var(--primary); }
             
-            .controls-row { display: flex; justify-content: space-between; width: 100%; align-items: center; }
-
-            /* Switcher */
-            .switcher {
-                background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border);
-                border-radius: 20px; padding: 2px; display: flex;
-            }
-            .model-btn {
-                padding: 5px 10px; border-radius: 16px; font-size: 10px; font-weight: 600;
-                color: #888; cursor: pointer; transition: 0.3s;
-            }
-            .model-btn.active-gemini { background: rgba(0, 242, 234, 0.2); color: var(--primary); }
-            .model-btn.active-gemma { background: rgba(255, 0, 85, 0.2); color: var(--gemma); }
-
-            /* Deep Think Toggle */
-            .dt-toggle {
-                display: flex; align-items: center; gap: 8px; font-size: 11px; color: #888; cursor: pointer;
-            }
-            .dt-box {
-                width: 14px; height: 14px; border: 1px solid #555; border-radius: 3px; display: flex; align-items: center; justify-content: center;
-            }
-            .dt-toggle.active { color: var(--director); text-shadow: 0 0 10px rgba(255, 215, 0, 0.3); }
-            .dt-toggle.active .dt-box { background: var(--director); border-color: var(--director); box-shadow: 0 0 8px var(--director); }
-
-            /* --- CHAT --- */
-            .chat-container {
-                flex-grow: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; scroll-behavior: smooth;
-            }
-            .message {
-                max-width: 85%; padding: 12px 16px; border-radius: 18px; font-size: 15px; line-height: 1.5;
-                position: relative; word-wrap: break-word; animation: popIn 0.2s ease;
-            }
-            .user-msg { align-self: flex-end; background: var(--user-bubble); color: #000; font-weight: 500; border-bottom-right-radius: 4px; }
-            .ai-msg { align-self: flex-start; background: var(--ai-bubble); color: #eee; border: 1px solid var(--glass-border); border-bottom-left-radius: 4px; }
-            .img-preview { max-width: 100%; border-radius: 10px; margin-top: 5px; display: block; }
-            @keyframes popIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-            /* --- INPUT --- */
-            .input-area {
-                padding: 15px; background: var(--header-bg); backdrop-filter: blur(20px);
-                border-top: 1px solid var(--glass-border); display: flex; gap: 10px; align-items: flex-end;
-                padding-bottom: max(15px, env(safe-area-inset-bottom));
-            }
-            .input-wrapper { flex-grow: 1; position: relative; }
+            .switcher { background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 20px; padding: 2px; display: flex; }
+            .mod-btn { padding: 5px 10px; border-radius: 16px; font-size: 10px; font-weight: 600; color: #888; cursor: pointer; }
+            .mod-btn.active { background: rgba(0, 242, 234, 0.2); color: var(--primary); }
             
-            textarea {
-                width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border);
-                padding: 12px 15px; border-radius: 20px; color: #fff; font-size: 16px; font-family: 'Outfit', sans-serif;
-                resize: none; height: 48px; max-height: 120px; transition: 0.3s;
-            }
+            .dt-toggle { font-size: 11px; color: #888; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+            .dt-box { width: 14px; height: 14px; border: 1px solid #555; border-radius: 3px; display: flex; align-items: center; justify-content: center; }
+            .dt-toggle.active { color: #ffd700; }
+            .dt-toggle.active .dt-box { background: #ffd700; border-color: #ffd700; color: #000; }
+
+            .chat { flex-grow: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+            .msg { max-width: 85%; padding: 12px 16px; border-radius: 18px; font-size: 15px; line-height: 1.5; word-wrap: break-word; animation: pop 0.2s ease; }
+            .user { align-self: flex-end; background: linear-gradient(135deg, var(--primary), #00a8a2); color: #000; font-weight: 500; border-bottom-right-radius: 4px; }
+            .ai { align-self: flex-start; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+            .img-prev { max-width: 100%; border-radius: 10px; margin-top: 5px; display: block; }
+            @keyframes pop { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+            .ai p { margin: 5px 0; }
+            .ai code { background: rgba(0,242,234,0.1); color: var(--primary); padding: 2px 4px; border-radius: 4px; font-family: monospace; }
+            .ai pre { background: rgba(0,0,0,0.5); padding: 10px; border-radius: 8px; overflow-x: auto; margin: 10px 0; }
+
+            .input-area { padding: 15px; background: var(--header); border-top: 1px solid var(--border); display: flex; gap: 10px; align-items: flex-end; padding-bottom: max(15px, env(safe-area-inset-bottom)); }
+            .txt-box { flex-grow: 1; position: relative; }
+            textarea { width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--border); padding: 12px 15px; border-radius: 20px; color: #fff; font-size: 16px; resize: none; height: 48px; max-height: 120px; transition: 0.3s; font-family: inherit; }
             textarea:focus { border-color: var(--primary); }
-
-            .icon-btn {
-                width: 48px; height: 48px; border-radius: 50%; border: 1px solid var(--glass-border);
-                background: rgba(255,255,255,0.05); color: #aaa; font-size: 18px;
-                display: flex; align-items: center; justify-content: center; transition: 0.2s; cursor: pointer; flex-shrink: 0;
-            }
+            
+            .icon-btn { width: 48px; height: 48px; border-radius: 50%; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: #aaa; font-size: 18px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; flex-shrink: 0; }
             .icon-btn:hover { color: var(--primary); border-color: var(--primary); }
-            #micBtn.recording { color: #ff0055; border-color: #ff0055; animation: breathe 1.5s infinite; }
-            @keyframes breathe { 0% { box-shadow: 0 0 0 0 rgba(255, 0, 85, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(255, 0, 85, 0); } }
+            .send-btn { background: var(--primary); color: #000; border: none; }
 
-            /* Image Preview */
-            #imageUploadPreview {
-                position: absolute; bottom: 60px; left: 15px; width: 60px; height: 60px;
-                border-radius: 10px; object-fit: cover; border: 2px solid var(--primary);
-                display: none; background: #000; z-index: 20;
-            }
-            .remove-img {
-                position: absolute; top: -8px; right: -8px; background: red; color: white;
-                width: 18px; height: 18px; border-radius: 50%; font-size: 12px;
-                display: flex; align-items: center; justify-content: center; cursor: pointer;
-            }
+            /* LIVE CALL MODAL */
+            .call-modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(5,5,8,0.95); z-index: 100; display: none; flex-direction: column; align-items: center; justify-content: center; backdrop-filter: blur(10px); }
+            .call-status { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 10px; }
+            .call-visualizer { display: flex; gap: 5px; height: 50px; align-items: center; margin-bottom: 40px; }
+            .bar { width: 6px; background: var(--primary); border-radius: 3px; animation: wave 1s infinite ease-in-out; height: 10px; }
+            @keyframes wave { 0%, 100% { height: 10px; opacity: 0.5; } 50% { height: 40px; opacity: 1; } }
+            
+            .call-controls { display: flex; gap: 20px; }
+            .call-btn { width: 70px; height: 70px; border-radius: 50%; border: none; display: flex; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; transition: 0.2s; }
+            .mute-btn { background: #333; color: #fff; }
+            .mute-btn.active { background: #fff; color: #000; }
+            .end-btn { background: #ff0055; color: #fff; transform: scale(1.1); }
+
+            #fileInput, #previewContainer { display: none; }
+            #previewContainer { position: absolute; bottom: 60px; left: 15px; }
+            #imageUploadPreview { width: 60px; height: 60px; border-radius: 10px; object-fit: cover; border: 2px solid var(--primary); }
 
         </style>
     </head>
     <body>
 
-        <div class="orb orb-1"></div>
-        <div class="orb orb-2"></div>
+        <div class="orb orb-1"></div><div class="orb orb-2"></div>
 
         <div class="header">
-            <div class="top-row">
+            <div class="top">
                 <div class="brand"><div class="dot"></div> Omni-Chat</div>
                 <div class="switcher">
-                    <div class="model-btn active-gemini" id="btnGemini" onclick="setModel('GEMINI')">Gemini 3</div>
-                    <div class="model-btn" id="btnGemma" onclick="setModel('GEMMA')">Gemma 27B</div>
+                    <div class="mod-btn active" id="btnGemini" onclick="setMod('GEMINI')">Gemini</div>
+                    <div class="mod-btn" id="btnGemma" onclick="setMod('GEMMA')">Gemma</div>
                 </div>
             </div>
-            <div class="controls-row">
-                <div class="dt-toggle" id="dtToggle" onclick="toggleDT()">
-                    <div class="dt-box"><i class="fa-solid fa-check" style="font-size: 8px; color: black; display: none;" id="dtCheck"></i></div>
-                    Deep Think (Director)
-                </div>
+            <div class="dt-toggle" id="dtToggle" onclick="toggleDT()">
+                <div class="dt-box"><i class="fa-solid fa-check" style="display:none" id="dtCheck"></i></div> Director Review
             </div>
         </div>
 
-        <div class="chat-container" id="chat">
-            <div class="message ai-msg">Online. Shift+Enter for new line.</div>
+        <div class="chat" id="chat">
+            <div class="msg ai">Online. Click the mic for Live Call.</div>
         </div>
 
         <div class="input-area">
-            <input type="file" id="fileInput" accept="image/*" style="display: none;" onchange="handleFile(this)">
-            <div id="previewContainer" style="display:none;">
-                <img id="imageUploadPreview">
-                <div class="remove-img" onclick="clearImage()">×</div>
-            </div>
+            <input type="file" id="fileInput" accept="image/*" onchange="handleFile(this)">
+            <div id="previewContainer"><img id="imageUploadPreview"></div>
 
-            <button class="icon-btn" onclick="document.getElementById('fileInput').click()">
-                <i class="fa-solid fa-paperclip"></i>
-            </button>
-
-            <div class="input-wrapper">
+            <button class="icon-btn" onclick="document.getElementById('fileInput').click()"><i class="fa-solid fa-paperclip"></i></button>
+            
+            <div class="txt-box">
                 <textarea id="prompt" placeholder="Message..." rows="1"></textarea>
             </div>
 
-            <button class="icon-btn" id="micBtn" ontouchstart="startRec()" ontouchend="stopRec()" onmousedown="startRec()" onmouseup="stopRec()">
-                <i class="fa-solid fa-microphone"></i>
-            </button>
-            <button class="icon-btn" style="background: var(--primary); color: #000; border: none;" onclick="sendText()">
-                <i class="fa-solid fa-arrow-up"></i>
-            </button>
+            <button class="icon-btn" onclick="startLiveCall()"><i class="fa-solid fa-microphone"></i></button>
+            <button class="icon-btn send-btn" onclick="sendText()"><i class="fa-solid fa-arrow-up"></i></button>
         </div>
 
-        <audio id="audioPlayer" style="display:none"></audio>
+        <div class="call-modal" id="callModal">
+            <div class="call-status" id="callStatus">Connecting...</div>
+            <div class="call-visualizer">
+                <div class="bar" style="animation-delay:0s"></div><div class="bar" style="animation-delay:0.1s"></div>
+                <div class="bar" style="animation-delay:0.2s"></div><div class="bar" style="animation-delay:0.3s"></div>
+            </div>
+            <div class="call-controls">
+                <button class="call-btn mute-btn" id="muteBtn" onclick="toggleMute()"><i class="fa-solid fa-microphone-slash"></i></button>
+                <button class="call-btn end-btn" onclick="endCall()"><i class="fa-solid fa-phone-slash"></i></button>
+            </div>
+        </div>
 
         <script>
-            let currentModel = 'GEMINI';
-            let deepThinkEnabled = false;
-            let currentImageBase64 = null;
+            let currMod = 'GEMINI';
+            let dtEnabled = false;
+            let imgBase64 = null;
+            let mediaRecorder = null;
+            let ws = null;
+            let audioContext = null;
+            let audioQueue = [];
+            let isPlaying = false;
 
-            function setModel(model) {
-                currentModel = model;
-                document.getElementById('btnGemini').className = model === 'GEMINI' ? 'model-btn active-gemini' : 'model-btn';
-                document.getElementById('btnGemma').className = model === 'GEMMA' ? 'model-btn active-gemma' : 'model-btn';
+            function setMod(m) {
+                currMod = m;
+                document.getElementById('btnGemini').className = m === 'GEMINI' ? 'mod-btn active' : 'mod-btn';
+                document.getElementById('btnGemma').className = m === 'GEMMA' ? 'mod-btn active' : 'mod-btn';
             }
 
             function toggleDT() {
-                deepThinkEnabled = !deepThinkEnabled;
-                document.getElementById('dtToggle').className = deepThinkEnabled ? 'dt-toggle active' : 'dt-toggle';
-                document.getElementById('dtCheck').style.display = deepThinkEnabled ? 'block' : 'none';
+                dtEnabled = !dtEnabled;
+                document.getElementById('dtToggle').className = dtEnabled ? 'dt-toggle active' : 'dt-toggle';
+                document.getElementById('dtCheck').style.display = dtEnabled ? 'block' : 'none';
             }
 
-            function addMsg(text, type, img=null) {
-                let div = document.createElement("div");
-                div.className = "message " + type;
-                if (img) {
-                    let i = document.createElement("img");
-                    i.src = img;
-                    i.className = "img-preview";
-                    div.appendChild(i);
-                }
-                let t = document.createElement("div");
-                t.innerText = text;
-                div.appendChild(t);
-                let container = document.getElementById("chat");
-                container.appendChild(div);
-                container.scrollTop = container.scrollHeight;
+            function addMsg(txt, type, isHtml=false) {
+                let d = document.createElement("div");
+                d.className = "msg " + type;
+                if(isHtml) d.innerHTML = txt; else d.innerText = txt;
+                let c = document.getElementById("chat");
+                c.appendChild(d);
+                c.scrollTop = c.scrollHeight;
             }
 
-            // Image Logic
-            function handleFile(input) {
-                if (input.files && input.files[0]) {
-                    let reader = new FileReader();
-                    reader.onload = function(e) {
-                        currentImageBase64 = e.target.result.split(',')[1];
-                        let preview = document.getElementById('imageUploadPreview');
-                        preview.src = e.target.result;
-                        document.getElementById('previewContainer').style.display = 'block';
-                        preview.style.display = 'block';
-                    }
-                    reader.readAsDataURL(input.files[0]);
-                }
-            }
-            function clearImage() {
-                currentImageBase64 = null;
-                document.getElementById('fileInput').value = "";
-                document.getElementById('previewContainer').style.display = 'none';
-            }
-
-            // Textarea Logic (Shift+Enter)
-            const promptInput = document.getElementById("prompt");
-            promptInput.addEventListener("input", function() { this.style.height = "auto"; this.style.height = (this.scrollHeight) + "px"; });
-            promptInput.addEventListener("keydown", function(e) {
-                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendText(); }
-            });
+            const txtIn = document.getElementById("prompt");
+            txtIn.addEventListener("input", function() { this.style.height = "auto"; this.style.height = this.scrollHeight + "px"; });
+            txtIn.addEventListener("keydown", function(e) { if(e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendText(); } });
 
             function sendText() {
-                let txt = promptInput.value.trim();
-                if(!txt && !currentImageBase64) return;
-
-                let imgSrc = currentImageBase64 ? "data:image/jpeg;base64," + currentImageBase64 : null;
-                addMsg(txt, "user-msg", imgSrc);
+                let t = txtIn.value.trim();
+                if(!t && !imgBase64) return;
                 
-                promptInput.value = "";
-                promptInput.style.height = "48px";
+                addMsg(t, "user");
+                txtIn.value = "";
+                txtIn.style.height = "48px";
                 
-                let payload = { prompt: txt, model: currentModel, deep_think: deepThinkEnabled };
-                if (currentImageBase64) { payload.image = currentImageBase64; clearImage(); }
-
-                if (deepThinkEnabled) addMsg("Director is reviewing...", "ai-msg");
+                let p = { prompt: t, model: currMod, deep_think: dtEnabled };
+                if(imgBase64) { p.image = imgBase64; imgBase64 = null; document.getElementById('previewContainer').style.display='none'; }
 
                 fetch("/process_text", {
-                    method: "POST", headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify(payload)
-                }).then(r=>r.json()).then(d => {
-                    addMsg(d.text, "ai-msg");
-                });
+                    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(p)
+                }).then(r=>r.json()).then(d => addMsg(d.html || d.text, "ai", true));
             }
 
-            // Voice Logic
-            let recorder, chunks = [];
-            async function startRec() {
-                document.getElementById("micBtn").classList.add("recording");
-                try {
-                    let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    recorder = new MediaRecorder(stream);
-                    chunks = [];
-                    recorder.ondataavailable = e => chunks.push(e.data);
-                    recorder.start();
-                } catch(e) { alert("Mic denied"); }
-            }
-
-            function stopRec() {
-                document.getElementById("micBtn").classList.remove("recording");
-                if(!recorder) return;
-                recorder.stop();
-                recorder.onstop = () => {
-                    let blob = new Blob(chunks, { type: 'audio/webm' });
-                    let reader = new FileReader();
-                    reader.readAsDataURL(blob);
-                    reader.onloadend = () => {
-                        let b64 = reader.result.split(',')[1];
-                        addMsg("🎤 Processing Audio...", "user-msg");
-                        fetch("/process_voice", {
-                            method: "POST", headers: {"Content-Type": "application/json"},
-                            body: JSON.stringify({audio: b64})
-                        }).then(r=>r.json()).then(d => {
-                            addMsg(d.text, "ai-msg");
-                            if(d.audio) {
-                                let aud = document.getElementById("audioPlayer");
-                                aud.src = "data:audio/mp3;base64," + d.audio;
-                                aud.play();
-                            }
-                        });
+            function handleFile(input) {
+                if (input.files[0]) {
+                    let r = new FileReader();
+                    r.onload = e => {
+                        imgBase64 = e.target.result.split(',')[1];
+                        document.getElementById('imageUploadPreview').src = e.target.result;
+                        document.getElementById('previewContainer').style.display = 'block';
                     };
-                };
+                    r.readAsDataURL(input.files[0]);
+                }
             }
+
+            // --- LIVE CALL LOGIC ---
+            async function startLiveCall() {
+                document.getElementById('callModal').style.display = 'flex';
+                document.getElementById('callStatus').innerText = "Connecting...";
+                
+                try {
+                    // Audio Context for Playback
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+
+                    // Mic Stream
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+                    
+                    // WebSocket
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    ws = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
+                    
+                    ws.onopen = () => {
+                        document.getElementById('callStatus').innerText = "Live";
+                        // Start Recording Loop
+                        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                        mediaRecorder.ondataavailable = (e) => {
+                            if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                                const reader = new FileReader();
+                                reader.onload = () => {
+                                    const b64 = reader.result.split(',')[1];
+                                    ws.send(JSON.stringify({ audio: b64 }));
+                                };
+                                reader.readAsDataURL(e.data);
+                            }
+                        };
+                        mediaRecorder.start(100); // 100ms chunks
+                    };
+
+                    ws.onmessage = async (event) => {
+                        const data = JSON.parse(event.data);
+                        if(data.audio) {
+                            playPCM(data.audio);
+                        }
+                    };
+
+                    ws.onclose = () => endCall();
+
+                } catch(e) {
+                    alert("Call Failed: " + e);
+                    endCall();
+                }
+            }
+
+            function playPCM(b64) {
+                // Decode Base64
+                const binaryString = window.atob(b64);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                // Convert PCM to AudioBuffer
+                const int16 = new Int16Array(bytes.buffer);
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) {
+                    float32[i] = int16[i] / 32768; // Normalize
+                }
+
+                const buffer = audioContext.createBuffer(1, float32.length, 24000);
+                buffer.getChannelData(0).set(float32);
+
+                audioQueue.push(buffer);
+                schedulePlayback();
+            }
+
+            function schedulePlayback() {
+                if (isPlaying || audioQueue.length === 0) return;
+                isPlaying = true;
+
+                const buffer = audioQueue.shift();
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+                source.onended = () => {
+                    isPlaying = false;
+                    schedulePlayback();
+                };
+                source.start();
+            }
+
+            function toggleMute() {
+                if(mediaRecorder) {
+                    if(mediaRecorder.state === "recording") { mediaRecorder.pause(); document.getElementById('muteBtn').classList.add('active'); }
+                    else { mediaRecorder.resume(); document.getElementById('muteBtn').classList.remove('active'); }
+                }
+            }
+
+            function endCall() {
+                if(ws) ws.close();
+                if(mediaRecorder) mediaRecorder.stop();
+                if(audioContext) audioContext.close();
+                document.getElementById('callModal').style.display = 'none';
+                addMsg("Call Ended", "ai");
+            }
+
         </script>
     </body>
     </html>
     '''
 
-# --- BACKEND ---
+# --- BACKEND REST ---
 
 @app.route('/process_text', methods=['POST'])
 def process_text():
     data = request.json
-    res = call_ai("text", model_id=data.get('model'), prompt=data.get('prompt'), image_data=data.get('image'), deep_think=data.get('deep_think'))
-    return jsonify({"text": res["text"]})
-
-@app.route('/process_voice', methods=['POST'])
-def process_voice():
-    res = call_ai("voice", audio_data=request.json.get('audio'))
-    return jsonify({"text": res["text"], "audio": res["audio"]})
+    p = data.get('prompt')
+    m = data.get('model')
+    dt = data.get('deep_think')
+    img = data.get('image')
+    
+    text_res = call_ai_text(m, p, img, dt)
+    html = parse_markdown(text_res)
+    return jsonify({"text": text_res, "html": html})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
